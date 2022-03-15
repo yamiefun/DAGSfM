@@ -7,14 +7,14 @@ completeness_ratio=$4
 # max_num_cluster_pairs=$4
 
 
-/home/amax/Projects/colmap/build/src/exe/colmap feature_extractor \
+/home/apple/F/henry/DAGSfM/build/src/exe/colmap feature_extractor \
 --database_path=$DATASET_PATH/database.db \
---image_path=$DATASET_PATH/images \
+--image_path=$DATASET_PATH \
 --SiftExtraction.num_threads=8 \
 --SiftExtraction.use_gpu=0 \
 --SiftExtraction.gpu_index=-1
 
-/home/amax/Projects/colmap/build/src/exe/colmap exhaustive_matcher \
+/home/apple/F/henry/DAGSfM/build/src/exe/colmap exhaustive_matcher \
 --database_path=$DATASET_PATH/database.db \
 --SiftMatching.num_threads=8 \
 --SiftMatching.use_gpu=0 \
@@ -29,7 +29,7 @@ completeness_ratio=$4
 # --VocabTreeMatching.num_nearest_neighbors=5 \
 # --VocabTreeMatching.vocab_tree_path=$VOC_TREE_PATH
 
-/home/amax/Projects/colmap/build/src/exe/colmap distributed_mapper \
+/home/apple/F/henry/DAGSfM/build/src/exe/colmap distributed_mapper \
 $DATASET_PATH/$log_folder \
 --database_path=$DATASET_PATH/database.db \
 --image_path=$DATASET_PATH/images \
@@ -39,5 +39,6 @@ $DATASET_PATH/$log_folder \
 --num_images_ub=$num_images_ub \
 --completeness_ratio=$completeness_ratio \
 --relax_ratio=1.3 \
---cluster_type=NCUT
+--cluster_type=NCUT \
+--imu=/home/apple/F/EC/VIO
 # --image_overlap=$image_overlap \

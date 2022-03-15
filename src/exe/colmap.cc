@@ -1000,6 +1000,7 @@ int RunDistributedMapper(int argc, char** argv)
     options.AddDefaultOption("max_num_cluster_pairs", &clustering_options.max_num_cluster_pairs);
     options.AddDefaultOption("cluster_type", &clustering_options.cluster_type);
     options.AddDefaultOption("graph_dir", &clustering_options.graph_dir);
+    options.AddDefaultOption("imu", &distributed_options.VIO_folder_path);
     options.AddMapperOptions();
     options.Parse(argc, argv);
 

@@ -14,7 +14,28 @@
 using namespace colmap;
 
 namespace GraphSfM {
-
+struct Coordinate
+{
+    double x;
+    double y;
+    double z;
+};
+struct FindVIO
+{
+    bool found;
+    GraphSfM::Coordinate coordinate;
+};
+struct VIOInfo
+{
+    bool has_VIO;
+    GraphSfM::Coordinate coordinate;
+    uint VIO_group_id;
+};
+struct ImageInfo
+{
+    std::string image_name;
+    GraphSfM:: VIOInfo VIO_info;
+};
 // Distributed mapping for very large scale structure from motion.
 // This mapper first partition images into the given number of clusters, 
 // then reconstruct each cluster with incremental/global/hybrid SfM approaches.
@@ -40,6 +61,9 @@ public:
         // The number of workers used to reconstruct clusters in parallel
         int num_workers = -1;
 
+        // The path to the folder of imu information file which is used as input
+        std::string VIO_folder_path;
+
         bool Check() const;
     };
     
@@ -60,6 +84,25 @@ private:
                   std::vector<int>& num_inliers,
                   std::unordered_map<image_t, std::string>& image_id_to_name,
                   std::vector<image_t>& image_ids);
+
+    void LoadVIO(std::vector<std::vector<std::pair<std::string, GraphSfM::Coordinate>>>& ts_to_VIO,
+                 std::vector<std::pair<std::string, std::string>>& VIO_summary);
+
+    std::string ParseImageNameFromPath(std::string path);
+
+    bool CHECK_TS_LE(std::string ts1, std::string ts2);
+
+    GraphSfM::VIOInfo CheckImageWithVIO(
+        std::vector<std::pair<std::string, std::string>>& VIO_summary,
+        std::vector<std::vector<std::pair<std::string, GraphSfM::Coordinate>>>& ts_to_VIO,
+        std::string& target);
+
+    void MatchImageWithCoordinate(
+        std::unordered_map<image_t, GraphSfM::ImageInfo>& image_information,
+        std::unordered_map<image_t, std::string>& image_id_to_name,
+        std::vector<std::vector<std::pair<std::string, GraphSfM::Coordinate>>>& ts_to_VIO,
+        std::vector<std::pair<std::string, std::string>>& VIO_summary);
+
 
     std::vector<ImageCluster> ClusteringScenes(
         const std::vector<std::pair<image_t, image_t>>& image_pairs,
