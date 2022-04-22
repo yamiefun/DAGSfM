@@ -13,6 +13,7 @@
 #include <boost/filesystem.hpp>
 #include <algorithm>
 #include <dirent.h>
+#include <set>
 
 using namespace colmap;
 
@@ -23,6 +24,7 @@ bool DistributedMapperController::Options::Check() const
     CHECK_OPTION_GT(num_workers, -1);
     return true;
 }
+
 
 DistributedMapperController::DistributedMapperController(
     const Options& options,
@@ -37,6 +39,7 @@ DistributedMapperController::DistributedMapperController(
     CHECK(options.Check());
 }
 
+
 void DistributedMapperController::Run()
 {
     //////////////////////////////////////////////////////////////////
@@ -50,13 +53,20 @@ void DistributedMapperController::Run()
     std::vector<image_t> image_ids;
     LoadData(image_pairs, num_inliers, image_id_to_name, image_ids);
 
+    // For each VIO file, create a vector record ts -> VIO mapping.
+    // There may be multiple files, so it's a vector of vector.
     std::vector<std::vector<std::pair<std::string, GraphSfM::Coordinate>>> ts_to_VIO;
+
+    // Store each VIO file's starting ts and ending ts.
     std::vector<std::pair<std::string, std::string>> VIO_summary;
     LoadVIO(ts_to_VIO, VIO_summary);
-    // std::string ts_start = ts_to_VIO.front().first;
-    // std::string ts_end = ts_to_VIO.back().first;
-    // LOG(INFO) << "VIO timestamp range: from " << ts_start << " to " << ts_end << std::endl;
 
+    // Find VIO threshold (height and drift thresh)
+    std::vector<GraphSfM::VIOThresh> vio_thresh;
+    CalculateVIOThresh(vio_thresh, ts_to_VIO);
+    LOG(INFO) << "XDDDDDDDDheight thresh: " << vio_thresh[0].height_thresh << std::endl;
+
+    // Mapping from image_id to image information, including VIO info.
     std::unordered_map<image_t, GraphSfM::ImageInfo> image_information;
     MatchImageWithCoordinate(
         image_information, image_id_to_name, ts_to_VIO, VIO_summary);
@@ -64,9 +74,28 @@ void DistributedMapperController::Run()
     //     LOG(INFO) << image_info.first << std::endl;
     // }
 
-    std::unique_ptr<ImageClustering> image_clustering_;
-    std::vector<ImageCluster> inter_clusters = 
-        ClusteringScenes(image_pairs, num_inliers, image_ids);
+    ImageCluster image_cluster;
+    std::vector<ImageCluster> inter_clusters;
+    if (!VIO_summary.empty()){
+        // create viewing graph with VIO
+        LOG(INFO) << "Found VIO file.\n";
+        CreateImageViewGraph(
+            image_information, image_pairs, num_inliers, image_ids, image_cluster, vio_thresh);
+        LOG(INFO) << "FINISH HERE\n";
+        return;
+        // clustering
+        inter_clusters = ClusteringScenesWithViewGraph(image_cluster);
+    }
+    else{
+        LOG(INFO) << "No VIO file found...\n";
+        inter_clusters = ClusteringScenes(image_pairs, num_inliers, image_ids);
+    }
+    
+
+    // std::unique_ptr<ImageClustering> image_clustering_;
+    
+
+    
 
     // ////////////////////////////////////////////////////////////////
     // // 2. Reconstruct all clusters in parallel/distributed manner //
@@ -94,6 +123,7 @@ void DistributedMapperController::Run()
     GetTimer().PrintMinutes();
 }
 
+
 BundleAdjustmentOptions DistributedMapperController::GlobalBundleAdjustment() const 
 {
     BundleAdjustmentOptions options;
@@ -115,6 +145,7 @@ BundleAdjustmentOptions DistributedMapperController::GlobalBundleAdjustment() co
         BundleAdjustmentOptions::LossFunctionType::TRIVIAL;
     return options;
 }
+
 
 bool DistributedMapperController::IsPartialReconsExist(std::vector<Reconstruction*>& recons) const
 {
@@ -141,6 +172,7 @@ bool DistributedMapperController::IsPartialReconsExist(std::vector<Reconstructio
     return true;
 }
 
+
 void DistributedMapperController::LoadData(
     std::vector<std::pair<image_t, image_t>>& image_pairs,
     std::vector<int>& num_inliers,
@@ -164,18 +196,19 @@ void DistributedMapperController::LoadData(
     database.ReadTwoViewGeometryNumInliers(&image_pairs, &num_inliers);
 }
 
+
 void DistributedMapperController::LoadVIO(
     std::vector<std::vector<std::pair<std::string, GraphSfM::Coordinate>>>& ts_to_VIO,
     std::vector<std::pair<std::string, std::string>>& VIO_summary)
 {
-    LOG(INFO) << "Parsing VIO file " << options_.VIO_folder_path << "...";
-    // std::fstream vio_file;
-    // vio_file.open(options_.VIO_folder_path);
+    LOG(INFO) << "Parsing VIO file in " << options_.VIO_folder_path << "...";
     namespace b_fs = boost::filesystem;
     DIR *dr;
     struct dirent *d;
     dr = opendir(options_.VIO_folder_path.c_str());
     b_fs::path dir (options_.VIO_folder_path);
+
+    // get all VIO files
     std::vector<std::string> VIO_files;
     if (dr != NULL){
         for (d = readdir (dr); d != NULL; d = readdir(dr)){
@@ -188,6 +221,7 @@ void DistributedMapperController::LoadVIO(
         }
         closedir(dr);
     }
+
     // loop and read each VIO file
     for (const auto & vio_file_path : VIO_files){
         std::vector<std::pair<std::string, GraphSfM::Coordinate>> ts_VIO_pairs;
@@ -197,7 +231,6 @@ void DistributedMapperController::LoadVIO(
         size_t pos = 0;
         std::string substring;
         std::string line;
-        getline(vio_file, line);
         while (getline(vio_file, line)){
             uint parse_idx = 0;
             std::string ts;
@@ -211,10 +244,10 @@ void DistributedMapperController::LoadVIO(
                 else if (parse_idx == 1)
                     coordinate.x = std::stod(substring);
                 else if (parse_idx == 2)
-                    coordinate.y = std::stod(substring);
-                else if (parse_idx == 3)
                     coordinate.z = std::stod(substring);
-                parse_idx += 1;
+                else if (parse_idx == 3)
+                    coordinate.y = std::stod(substring);
+                parse_idx++;
             }
             ts_VIO_pairs.push_back(std::make_pair(ts, coordinate));
         }
@@ -230,6 +263,51 @@ void DistributedMapperController::LoadVIO(
     }
 }
 
+
+double DistributedMapperController::square_distance_3d(
+    GraphSfM::Coordinate& coord1, GraphSfM::Coordinate& coord2
+)
+{
+    return pow(coord1.x - coord2.x, 2) +
+           pow(coord1.y - coord2.y, 2) +
+           pow(coord1.z - coord2.z, 2);
+}
+
+
+void DistributedMapperController::CalculateVIOThresh(
+    std::vector<GraphSfM::VIOThresh>& vio_thresh,
+    std::vector<std::vector<std::pair<std::string, GraphSfM::Coordinate>>>& ts_to_VIO)
+{
+    auto compare_height = 
+        [](std::pair<std::string, GraphSfM::Coordinate> vio_info1,
+           std::pair<std::string, GraphSfM::Coordinate> vio_info2) -> bool
+        {return vio_info1.second.y < vio_info2.second.y;};
+    for (auto & ts_VIO_pairs : ts_to_VIO){
+        // Height threshold:
+        // Find highest and lowest VIO info, divided by a magic number 8.
+        double highest = std::max_element(
+            ts_VIO_pairs.begin(), ts_VIO_pairs.end(), compare_height)->second.y;
+        double lowest = std::min_element(
+            ts_VIO_pairs.begin(), ts_VIO_pairs.end(), compare_height)->second.y;
+        double height_thresh = (highest - lowest) / 8;
+
+        // Drift threshold:
+        // Find 3d distance between every adjacent VIO coordinates, divided by number of VIO info,
+        // multiplied by a magic number 20.
+        double drift_sum = 0.0;
+        double drift_thresh;
+        for (std::size_t i = 1; i < ts_VIO_pairs.size(); ++i){
+            drift_sum += square_distance_3d(
+                ts_VIO_pairs[i].second, ts_VIO_pairs[i-1].second);
+        }
+        drift_thresh = 40 * (drift_sum / ts_VIO_pairs.size());
+        height_thresh = 0.15;
+        GraphSfM::VIOThresh thresh{height_thresh, drift_thresh};
+        vio_thresh.push_back(thresh);
+    }
+}
+
+
 std::string DistributedMapperController::ParseImageNameFromPath(std::string path){
     std::string base_filename = path.substr(path.find_last_of("/\\") + 1);
     std::string::size_type const p(base_filename.find_last_of('.'));
@@ -237,9 +315,11 @@ std::string DistributedMapperController::ParseImageNameFromPath(std::string path
     return file_without_extension;
 }
 
+
 bool DistributedMapperController::CHECK_TS_LE(std::string ts1, std::string ts2){
     return std::strcmp(ts1.c_str(), ts2.c_str()) <= 0;
 }
+
 
 GraphSfM::VIOInfo DistributedMapperController::CheckImageWithVIO(
     std::vector<std::pair<std::string, std::string>>& VIO_summary,
@@ -286,6 +366,7 @@ GraphSfM::VIOInfo DistributedMapperController::CheckImageWithVIO(
     return VIO_info;
 }
 
+
 void DistributedMapperController::MatchImageWithCoordinate(
     std::unordered_map<image_t, GraphSfM::ImageInfo>& image_information,
     std::unordered_map<image_t, std::string>& image_id_to_name,
@@ -301,10 +382,241 @@ void DistributedMapperController::MatchImageWithCoordinate(
             GraphSfM::ImageInfo image_info;
             image_info.image_name = image_name;
             image_info.VIO_info = VIO_info;
-            LOG(INFO) << "EMPLACE" << std::endl;
             image_information.emplace(image.first, image_info);
         }
     }
+}
+
+
+bool DistributedMapperController::CHECK_STR_LT(std::string& ts1, std::string& ts2){
+    for (uint i = 0; i < ts1.length(); ++i){
+        if (ts1[i] < ts2[i])
+            return true;
+        else if (ts1[i] > ts2[i])
+            return false;
+    }
+    return false;
+}
+
+
+int DistributedMapperController::ts_diff(std::string ts1, std::string ts2){
+    // Calculate two timestamp diff.
+    // Assume both timestamp are legal with same length.
+
+    if (CHECK_STR_LT(ts1, ts2))
+        swap(ts1, ts2);
+    std::string subtract = "";
+    int carry = 0;
+    for (int i = ts1.length()-1; i >= 0; --i){
+        int sub = ((ts1[i] - '0') - (ts2[i] -  '0') - carry);
+        if (sub < 0){
+            sub += 10;
+            carry = 1;
+        }
+        else{
+            carry = 0;
+        }
+        subtract.push_back(sub + '0');
+    }
+    reverse(subtract.begin(), subtract.end());
+    std::string second = subtract.substr(0, 10);
+    second.erase(0, std::min(second.find_first_not_of('0'), second.size()-1));
+    return std::stoi(second);
+}
+
+
+void DistributedMapperController::CreateImageViewGraph(
+    std::unordered_map<image_t, GraphSfM::ImageInfo>& image_information,
+    std::vector<std::pair<image_t, image_t>>& image_pairs,
+    std::vector<int>& num_inliers,
+    std::vector<image_t>& image_ids,
+    ImageCluster& image_cluster,
+    std::vector<GraphSfM::VIOThresh>& vio_thresh)
+{
+    LOG(INFO) << "Creating view graph with VIO..." << std::endl;
+    // double coor_thresh; 
+    int ts_thresh = 30;
+
+    // collect all edges with weight
+    std::unordered_map<ViewIdPair, int> edges;
+    for (uint i = 0; i < image_pairs.size(); ++i) {
+        const ViewIdPair view_pair(image_pairs[i].first, image_pairs[i].second);
+        edges[view_pair] = num_inliers[i];
+    }
+
+    // collect all image ids which has vio info
+    std::set<image_t> images_with_vio;
+    for (const auto & image : image_information){
+        if (image.second.VIO_info.has_VIO)
+            images_with_vio.insert(image.first);
+    }
+
+    // memo of images which are added into graph already
+    std::set<image_t> image_added;
+
+    // 1. Consider edges which both vertices have VIO info
+    LOG(INFO) << "Building view graph's arterial..." << std::endl;
+    for (const auto & image1 : images_with_vio){
+        for (const auto & image2 : images_with_vio){
+            // redundant, assure id1 < id2
+            if (image1 >= image2)
+                continue;
+
+            // Same image or two images not in same ts range
+            if (image_information[image1].VIO_info.VIO_group_id !=
+                image_information[image2].VIO_info.VIO_group_id)
+                continue;
+
+            const ViewIdPair view_pair(image1, image2);
+            if (edges.find(view_pair) == edges.end())
+                continue;
+            // Check ts diff between two image
+            if (ts_diff(image_information[image1].image_name,
+                        image_information[image2].image_name) <= ts_thresh){
+                image_cluster.edges[view_pair] = edges[view_pair];
+                if (image_added.find(image1) == image_added.end()){
+                    image_cluster.image_ids.push_back(image1);
+                    image_added.insert(image1);
+                }
+                if (image_added.find(image2) == image_added.end()){
+                    image_cluster.image_ids.push_back(image2);
+                    image_added.insert(image2);
+                }
+            }
+
+            // Consider drift thresh and height thresh
+            GraphSfM::Coordinate coord1 = image_information[image1].VIO_info.coordinate;
+            GraphSfM::Coordinate coord2 = image_information[image2].VIO_info.coordinate;
+            uint group_id = image_information[image1].VIO_info.VIO_group_id;
+            // if (square_distance_3d(coord1, coord2) <= vio_thresh[group_id].drift_thresh ||
+            //         abs(coord1.y - coord2.y) <= vio_thresh[group_id].height_thresh){
+            // if (square_distance_3d(coord1, coord2) <= vio_thresh[group_id].drift_thresh){
+            // if (abs(coord1.y - coord2.y) < vio_thresh[group_id].height_thresh){
+            //     LOG(INFO) << "height thresh " << vio_thresh[group_id].height_thresh << std::endl;
+            //     image_cluster.edges[view_pair] = edges[view_pair];
+            //     if (image_added.find(image1) == image_added.end()){
+            //         image_cluster.image_ids.push_back(image1);
+            //         image_added.insert(image1);
+            //     }
+            //     if (image_added.find(image2) == image_added.end()){
+            //         image_cluster.image_ids.push_back(image2);
+            //         image_added.insert(image2);
+            //     }
+            // }
+        }
+    }
+    // 2. Consider rest of edges
+    int image_remain = image_ids.size() - image_added.size();
+    LOG(INFO) << "Add rest images into view graph, image nums: " << image_remain << std::endl;
+    double weight_vio = 1.0;
+    double weight_no_vio = 0.8;
+    while (image_remain > 0){
+        LOG(INFO) << "remain image num: " << image_remain << std::endl;
+        double best_score = 0.0;
+        image_t best_id;
+        for (auto & image_id : image_ids){
+            // check if image is already in graph
+            if (image_added.find(image_id) != image_added.end())
+                continue;
+            double cur_score;
+            cur_score = CalculateScore(
+                image_id, image_added, edges, images_with_vio, weight_vio, weight_no_vio);
+            if (cur_score > best_score){
+                best_score = cur_score;
+                best_id = image_id;
+            }
+        }
+        LOG(INFO) << "Add image score: " << best_score << std::endl;
+        // add all edges from best_id image to images that are in graph already
+        // weight the edges depends on the reference image has VIO or not
+        for (auto & image_id : image_added){
+            if (best_id == image_id)
+                continue;
+            ViewIdPair view_pair;
+            view_pair = (best_id < image_id) ?
+                std::make_pair(best_id, image_id) :
+                std::make_pair(image_id, best_id);
+
+            // const ViewIdPair view_pair(best_id, image_id);
+            if (edges.find(view_pair) != edges.end()){
+                if (images_with_vio.find(image_id) != images_with_vio.end()){
+                    image_cluster.edges[view_pair] = edges[view_pair] * weight_vio;
+                }
+                else{
+                    image_cluster.edges[view_pair] = edges[view_pair] * weight_no_vio;
+                }
+            }
+        }
+        image_remain--;
+
+        // add image to graph
+        image_cluster.image_ids.push_back(best_id);
+        image_added.insert(best_id);
+    }
+
+    // 3. Delete false positive feature matches in database
+    LOG(INFO) << "Delete false feature matches in database..." << std::endl;
+    Database database(options_.database_path);
+    for (uint i = 0; i < image_pairs.size(); ++i){
+        image_t image_id1 = image_pairs[i].first;
+        image_t image_id2 = image_pairs[i].second;
+        const ViewIdPair view_pair(image_id1, image_id2);
+        if (image_cluster.edges.find(view_pair) == image_cluster.edges.end()){
+            database.DeleteInlierMatches(image_id1, image_id2);
+            LOG(INFO) << "Delete inlier match: " << image_id1 << " " << image_id2 << std::endl;
+        }
+    }
+
+    // Check graph completness
+    // LOG(INFO) << "Number of images in graph: " << image_cluster.image_ids.size() << std::endl;
+    // LOG(INFO) << "Number of images (total): " << image_ids.size() << std::endl;
+}
+
+
+double DistributedMapperController::CalculateScore(
+    image_t& image_id,
+    std::set<image_t>& image_added,
+    std::unordered_map<ViewIdPair, int>& edges,
+    std::set<image_t>& images_with_vio,
+    double& weight_vio, double& weight_no_vio)
+{
+    double best_score = 0.0;
+    for (auto & ref_image : image_added){
+        // find all reference images
+        std::vector<image_t> ref_images;
+        ref_images.push_back(ref_image);
+        for (auto & ref_neighbor : image_added){
+            if (ref_neighbor == ref_image)
+                continue;
+            ViewIdPair view_pair;
+            view_pair = (ref_image < ref_neighbor) ?
+                std::make_pair(ref_image, ref_neighbor) :
+                std::make_pair(ref_neighbor, ref_image);
+            if (edges.find(view_pair) != edges.end()){
+                ref_images.push_back(ref_neighbor);
+            }
+        }
+
+        // mean weighted sum of all reference images with target image
+        double cur_score = 0.0;
+        uint edge_count = 0;
+        for (auto & ref : ref_images){
+            ViewIdPair view_pair;
+            view_pair = (image_id < ref) ?
+                std::make_pair(image_id, ref) :
+                std::make_pair(ref, image_id);
+            if (edges.find(view_pair) != edges.end()){
+                edge_count += 1;
+                if (images_with_vio.find(ref) != images_with_vio.end())
+                    cur_score += weight_vio * edges[view_pair];
+                else
+                    cur_score += weight_no_vio * edges[view_pair];
+            }
+        }
+        cur_score = cur_score / edge_count;
+        best_score = std::max(best_score, cur_score);
+    }
+    return best_score;
 }
 
 
@@ -319,9 +631,11 @@ std::vector<ImageCluster> DistributedMapperController::ClusteringScenes(
     image_cluster.image_ids = image_ids;
     for (uint i = 0; i < image_pairs.size(); i++) {
         const ViewIdPair view_pair(image_pairs[i].first, image_pairs[i].second);
+        // VIO trim here
         image_cluster.edges[view_pair] = num_inliers[i];
     }
 
+    // create `image_clustering_` for clustering
     image_clustering_ = std::unique_ptr<ImageClustering>(
                         new ImageClustering(clustering_options_, image_cluster));
     image_clustering_->Cut();
@@ -329,6 +643,7 @@ std::vector<ImageCluster> DistributedMapperController::ClusteringScenes(
     // image_clustering_.CutAndExpand();
     image_clustering_->OutputClusteringSummary();
     
+    // obtain a vector of clusters
     std::vector<ImageCluster> inter_clusters = image_clustering_->GetInterClusters();
     for (auto cluster : inter_clusters) {
         cluster.ShowInfo();
@@ -336,6 +651,27 @@ std::vector<ImageCluster> DistributedMapperController::ClusteringScenes(
 
     return inter_clusters;
 }
+
+
+std::vector<ImageCluster> DistributedMapperController::ClusteringScenesWithViewGraph(
+    ImageCluster& image_cluster)
+{
+    image_clustering_ = std::unique_ptr<ImageClustering>(
+                        new ImageClustering(clustering_options_, image_cluster));
+    image_clustering_->Cut();
+    image_clustering_->Expand();
+    // image_clustering_.CutAndExpand();
+    image_clustering_->OutputClusteringSummary();
+    
+    // obtain a vector of clusters
+    std::vector<ImageCluster> inter_clusters = image_clustering_->GetInterClusters();
+    for (auto cluster : inter_clusters) {
+        cluster.ShowInfo();
+    }
+
+    return inter_clusters;
+}
+
 
 void DistributedMapperController::ReconstructPartitions(
     const std::unordered_map<image_t, std::string>& image_id_to_name,

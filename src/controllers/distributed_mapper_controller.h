@@ -36,6 +36,12 @@ struct ImageInfo
     std::string image_name;
     GraphSfM:: VIOInfo VIO_info;
 };
+struct VIOThresh
+{
+    double height_thresh;
+    double drift_thresh;
+};
+
 // Distributed mapping for very large scale structure from motion.
 // This mapper first partition images into the given number of clusters, 
 // then reconstruct each cluster with incremental/global/hybrid SfM approaches.
@@ -88,6 +94,10 @@ private:
     void LoadVIO(std::vector<std::vector<std::pair<std::string, GraphSfM::Coordinate>>>& ts_to_VIO,
                  std::vector<std::pair<std::string, std::string>>& VIO_summary);
 
+    void CalculateVIOThresh(
+        std::vector<GraphSfM::VIOThresh>& vio_thresh,
+        std::vector<std::vector<std::pair<std::string, GraphSfM::Coordinate>>>& ts_to_VIO);
+
     std::string ParseImageNameFromPath(std::string path);
 
     bool CHECK_TS_LE(std::string ts1, std::string ts2);
@@ -103,11 +113,37 @@ private:
         std::vector<std::vector<std::pair<std::string, GraphSfM::Coordinate>>>& ts_to_VIO,
         std::vector<std::pair<std::string, std::string>>& VIO_summary);
 
+    bool CHECK_STR_LT(std::string& ts1, std::string& ts2);
+
+    int ts_diff(std::string ts1, std::string ts2);
+
+    double square_distance_3d(GraphSfM::Coordinate& coord1, GraphSfM::Coordinate& coord2);
+
+    double CalculateScore(
+        image_t& image_id,
+        std::set<image_t>& image_added,
+        std::unordered_map<ViewIdPair, int>& edges,
+        std::set<image_t>& images_with_vio,
+        double& weight_vio, double& weight_no_vio
+    );
+
+    void CreateImageViewGraph(
+        std::unordered_map<image_t, GraphSfM::ImageInfo>& image_information,
+        std::vector<std::pair<image_t, image_t>>& image_pairs,
+        std::vector<int>& num_inliers,
+        std::vector<image_t>& image_ids,
+        ImageCluster& image_cluster,
+        std::vector<GraphSfM::VIOThresh>& vio_thresh);
+
 
     std::vector<ImageCluster> ClusteringScenes(
         const std::vector<std::pair<image_t, image_t>>& image_pairs,
         const std::vector<int>& num_inliers,
         const std::vector<image_t>& image_ids);
+
+    std::vector<ImageCluster> ClusteringScenesWithViewGraph(
+        ImageCluster& image_cluster);
+
 
     void ReconstructPartitions(
         const std::unordered_map<image_t, std::string>& image_id_to_name,

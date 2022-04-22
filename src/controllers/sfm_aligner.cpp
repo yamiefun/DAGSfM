@@ -401,8 +401,6 @@ void FindSimilarityTransform(const std::vector<Eigen::Vector3d>& observations1,
         }
         GraphSfM::FindRTS(x1, x2, &scale, &t, &R);
         GraphSfM::Refine_RTS(x1, x2, &scale, &t, &R);
-        
-        // msd = CheckReprojError(observations1, observations2, scale, R, t);
     }
 
     msd = CheckReprojError(observations1, observations2, scale, R, t);

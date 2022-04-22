@@ -50,6 +50,7 @@ void ImageClustering::Cut()
     CHECK_NOTNULL(cluster.get());
     LOG(INFO) << "cluster num: " << num_clusters;
 
+    // labels: image_id -> cluster_id
     std::unordered_map<int, int> labels = 
         cluster->ComputeCluster(image_pairs, weights, num_clusters);
 
