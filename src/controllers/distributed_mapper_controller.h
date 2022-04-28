@@ -121,8 +121,10 @@ private:
 
     double CalculateScore(
         image_t& image_id,
+        image_t& ref_id,
         std::set<image_t>& image_added,
         std::unordered_map<ViewIdPair, int>& edges,
+        std::unordered_map<image_t, std::set<image_t>>& graph,
         std::set<image_t>& images_with_vio,
         double& weight_vio, double& weight_no_vio
     );

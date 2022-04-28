@@ -64,7 +64,7 @@ void DistributedMapperController::Run()
     // Find VIO threshold (height and drift thresh)
     std::vector<GraphSfM::VIOThresh> vio_thresh;
     CalculateVIOThresh(vio_thresh, ts_to_VIO);
-    LOG(INFO) << "XDDDDDDDDheight thresh: " << vio_thresh[0].height_thresh << std::endl;
+    //LOG(INFO) << "Height thresh: " << vio_thresh[0].height_thresh << std::endl;
 
     // Mapping from image_id to image information, including VIO info.
     std::unordered_map<image_t, GraphSfM::ImageInfo> image_information;
@@ -439,10 +439,20 @@ void DistributedMapperController::CreateImageViewGraph(
 
     // collect all edges with weight
     std::unordered_map<ViewIdPair, int> edges;
-    for (uint i = 0; i < image_pairs.size(); ++i) {
+    for (size_t i = 0; i < image_pairs.size(); ++i) {
         const ViewIdPair view_pair(image_pairs[i].first, image_pairs[i].second);
         edges[view_pair] = num_inliers[i];
     }
+
+    // collect all edges in bidirection
+    std::unordered_map<image_t, std::set<image_t>> graph;
+    for (size_t i = 0; i < image_pairs.size(); ++i){
+        image_t node1 = image_pairs[i].first;
+        image_t node2 = image_pairs[i].second;
+        graph[node1].insert(node2);
+        graph[node2].insert(node1);
+    }
+
 
     // collect all image ids which has vio info
     std::set<image_t> images_with_vio;
@@ -510,48 +520,134 @@ void DistributedMapperController::CreateImageViewGraph(
     LOG(INFO) << "Add rest images into view graph, image nums: " << image_remain << std::endl;
     double weight_vio = 1.0;
     double weight_no_vio = 0.8;
-    while (image_remain > 0){
-        LOG(INFO) << "remain image num: " << image_remain << std::endl;
+    // while (image_remain > 0){
+    //     LOG(INFO) << "remain image num: " << image_remain << std::endl;
+    //     double best_score = 0.0;
+    //     image_t best_id;
+    //     for (auto & image_id : image_ids){
+    //         // check if image is already in graph
+    //         if (image_added.find(image_id) != image_added.end())
+    //             continue;
+    //         double cur_score;
+    //         cur_score = CalculateScore(
+    //             image_id, image_added, edges, graph, images_with_vio, weight_vio, weight_no_vio);
+    //         if (cur_score > best_score){
+    //             best_score = cur_score;
+    //             best_id = image_id;
+    //         }
+    //     }
+    //     LOG(INFO) << "Add image score: " << best_score << std::endl;
+    //     // add all edges from best_id image to images that are in graph already
+    //     // weight the edges depends on the reference image has VIO or not
+    //     for (auto & neighbor : graph[best_id]){
+    //         if (image_added.find(neighbor) == image_added.end())
+    //             continue;
+    //         const ViewIdPair view_pair = (best_id < neighbor) ?
+    //             std::make_pair(best_id, neighbor) : std::make_pair(neighbor, best_id);
+    //         image_cluster.edges[view_pair] =
+    //             (images_with_vio.find(neighbor) == images_with_vio.end())?
+    //             edges[view_pair] * weight_no_vio : edges[view_pair] * weight_vio;
+    //     }
+    //     // add image to graph
+    //     image_cluster.image_ids.push_back(best_id);
+    //     image_added.insert(best_id);
+    //     image_remain--;
+    // }
+
+    // 2.1. Maintain heap for edge strength
+    struct ScoreInfo{
+        double score;
+        image_t reference;
+    };
+    struct HeapData{
+        image_t image_id;
+        ScoreInfo score_info;
+    };
+    std::unordered_map<image_t, ScoreInfo> max_score;
+    std::vector<HeapData> edge_heap;
+    
+    for (auto & image_id : image_ids){
+        // Only consider images that are not added
+        if (image_added.find(image_id) != image_added.end())
+            continue;
         double best_score = 0.0;
-        image_t best_id;
+        image_t best_ref;
+        for (auto ref_id : graph[image_id]){
+            // Only consider reference images that are added
+            if (image_added.find(ref_id) == image_added.end())
+                continue;
+            double score = CalculateScore(
+                image_id, ref_id, image_added, edges, graph,
+                images_with_vio, weight_vio, weight_no_vio);
+            if (score > best_score){
+                best_score = score;
+                best_ref = ref_id;
+            }
+        }
+        ScoreInfo best_info = {best_score, best_ref};
+        max_score.emplace(image_id, best_info);
+        HeapData heap_data = {image_id, best_info};
+        edge_heap.push_back(heap_data);
+    }
+
+
+    const auto heap_cmp = [](const HeapData& info1, const HeapData& info2){
+        return info1.score_info.score < info2.score_info.score;
+    };
+    std::make_heap(edge_heap.begin(), edge_heap.end(), heap_cmp);
+
+    // 2.2. Always add the image with the largest score
+    while (!edge_heap.empty()){
+        HeapData heap_top = edge_heap.front();
+        std::pop_heap(edge_heap.begin(), edge_heap.end(), heap_cmp);
+        edge_heap.pop_back();
+        // Deal with redundancy
+        if (image_added.find(heap_top.image_id) != image_added.end())
+            continue;
+
+        // 2.2.1. Add edges to view grpah
+        LOG(INFO) << "Added image " << heap_top.image_id 
+                  << " with score: " << heap_top.score_info.score << std::endl;
+        for (const auto & neighbor : graph[heap_top.image_id]){
+            // Only consider edges that the end point is added
+            if (image_added.find(neighbor) == image_added.end())
+                continue;
+            const ViewIdPair view_pair = (heap_top.image_id < neighbor) ?
+                std::make_pair(heap_top.image_id, neighbor) :
+                std::make_pair(neighbor, heap_top.image_id);
+            image_cluster.edges[view_pair] = 
+                (images_with_vio.find(neighbor) == images_with_vio.end()) ?
+                edges[view_pair] * weight_no_vio : edges[view_pair] * weight_vio;
+        }
+        // 2.2.2. Add image
+        image_cluster.image_ids.push_back(heap_top.image_id);
+        image_added.insert(heap_top.image_id);
+
+        // 2.2.3. Update
         for (auto & image_id : image_ids){
-            // check if image is already in graph
+            // Only consider images that are not added
             if (image_added.find(image_id) != image_added.end())
                 continue;
-            double cur_score;
-            cur_score = CalculateScore(
-                image_id, image_added, edges, images_with_vio, weight_vio, weight_no_vio);
-            if (cur_score > best_score){
-                best_score = cur_score;
-                best_id = image_id;
-            }
-        }
-        LOG(INFO) << "Add image score: " << best_score << std::endl;
-        // add all edges from best_id image to images that are in graph already
-        // weight the edges depends on the reference image has VIO or not
-        for (auto & image_id : image_added){
-            if (best_id == image_id)
-                continue;
-            ViewIdPair view_pair;
-            view_pair = (best_id < image_id) ?
-                std::make_pair(best_id, image_id) :
-                std::make_pair(image_id, best_id);
-
-            // const ViewIdPair view_pair(best_id, image_id);
-            if (edges.find(view_pair) != edges.end()){
-                if (images_with_vio.find(image_id) != images_with_vio.end()){
-                    image_cluster.edges[view_pair] = edges[view_pair] * weight_vio;
-                }
-                else{
-                    image_cluster.edges[view_pair] = edges[view_pair] * weight_no_vio;
+            // Check if need to update max score
+            bool updated = false;
+            std::set<image_t> ref_candidate = graph[heap_top.image_id];
+            ref_candidate.insert(heap_top.image_id);
+            for (auto ref_id : ref_candidate){
+                double score = CalculateScore(
+                    image_id, ref_id, image_added, edges, graph,
+                    images_with_vio, weight_vio, weight_no_vio);
+                if (score > max_score[image_id].score){
+                    updated = true;
+                    max_score[image_id].score = score;
+                    max_score[image_id].reference = ref_id;
                 }
             }
+            if (updated){
+                HeapData heap_data = {image_id, max_score[image_id]};
+                edge_heap.push_back(heap_data);
+                std::push_heap(edge_heap.begin(), edge_heap.end(), heap_cmp);
+            }
         }
-        image_remain--;
-
-        // add image to graph
-        image_cluster.image_ids.push_back(best_id);
-        image_added.insert(best_id);
     }
 
     // 3. Delete false positive feature matches in database
@@ -575,48 +671,38 @@ void DistributedMapperController::CreateImageViewGraph(
 
 double DistributedMapperController::CalculateScore(
     image_t& image_id,
+    image_t& ref_id,
     std::set<image_t>& image_added,
     std::unordered_map<ViewIdPair, int>& edges,
+    std::unordered_map<image_t, std::set<image_t>>& graph,
     std::set<image_t>& images_with_vio,
     double& weight_vio, double& weight_no_vio)
 {
-    double best_score = 0.0;
-    for (auto & ref_image : image_added){
-        // find all reference images
-        std::vector<image_t> ref_images;
-        ref_images.push_back(ref_image);
-        for (auto & ref_neighbor : image_added){
-            if (ref_neighbor == ref_image)
-                continue;
-            ViewIdPair view_pair;
-            view_pair = (ref_image < ref_neighbor) ?
-                std::make_pair(ref_image, ref_neighbor) :
-                std::make_pair(ref_neighbor, ref_image);
-            if (edges.find(view_pair) != edges.end()){
-                ref_images.push_back(ref_neighbor);
-            }
+    std::vector<image_t> ref_images;
+    ref_images.push_back(ref_id);
+    // Find all neighbors as reference images
+    for (const auto & neighbor : graph[ref_id]){
+        // Only consider neighbors which are added
+        if (image_added.find(neighbor) != image_added.end()){
+            ref_images.push_back(neighbor);
         }
-
-        // mean weighted sum of all reference images with target image
-        double cur_score = 0.0;
-        uint edge_count = 0;
-        for (auto & ref : ref_images){
-            ViewIdPair view_pair;
-            view_pair = (image_id < ref) ?
-                std::make_pair(image_id, ref) :
-                std::make_pair(ref, image_id);
-            if (edges.find(view_pair) != edges.end()){
-                edge_count += 1;
-                if (images_with_vio.find(ref) != images_with_vio.end())
-                    cur_score += weight_vio * edges[view_pair];
-                else
-                    cur_score += weight_no_vio * edges[view_pair];
-            }
-        }
-        cur_score = cur_score / edge_count;
-        best_score = std::max(best_score, cur_score);
     }
-    return best_score;
+    // Calculate mean weighted sum of reference images
+    double score = 0.0;
+    uint edge_count = 0;
+    for (const auto & ref_image : ref_images){
+        const ViewIdPair view_pair = (image_id < ref_image) ?
+            std::make_pair(image_id, ref_image) :
+            std::make_pair(ref_image, image_id);
+        if (edges.find(view_pair) != edges.end()){
+            edge_count++;
+            score += (images_with_vio.find(ref_image) == images_with_vio.end()) ?
+                edges[view_pair] * weight_no_vio :
+                edges[view_pair] * weight_vio;
+        }
+    }
+    score /= edge_count;
+    return score;
 }
 
 
