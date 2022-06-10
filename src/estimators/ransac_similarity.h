@@ -179,7 +179,7 @@ public:
     double Error(const CorrespondenceEuc& ceuc, const Euclidean3D& euc) const
     {
         double reproj_err = 0.0;
-        for (int i = 0; i < _correspondences.size(); i++) {
+        for (size_t i = 0; i < _correspondences.size(); i++) {
             reproj_err += ReprojectionErr(_correspondences[i].p1,
                                           _correspondences[i].p2,
                                           euc.R, euc.t, _s);

@@ -6,6 +6,7 @@
 #include "util/reconstruction_io.h"
 
 #include <iostream>
+#include <iomanip>
 #include <utility>
 #include <vector>
 #include <fstream>
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <dirent.h>
 #include <set>
+#include <queue>
 
 using namespace colmap;
 
@@ -61,6 +63,13 @@ void DistributedMapperController::Run()
   std::vector<std::pair<std::string, std::string>> VIO_summary;
   LoadVIO(ts_to_VIO, VIO_summary);
 
+  std::vector<std::string> video_paths;
+  LoadVideo(video_paths);
+  std::unordered_map<image_t, GraphSfM::VideoInfo> video_frame_info;
+  ParseVideoFrames(video_paths, video_frame_info, image_id_to_name);
+  // LOG(INFO) << "STOP HERE\n";
+  // return;
+
   // Find VIO threshold (height and drift thresh)
   std::vector<GraphSfM::VIOThresh> vio_thresh;
   CalculateVIOThresh(vio_thresh, ts_to_VIO);
@@ -72,20 +81,29 @@ void DistributedMapperController::Run()
 
   ImageCluster image_cluster;
   std::vector<ImageCluster> inter_clusters;
-  if (!VIO_summary.empty()) {
+  /* Testing using video
+  
+  if (!VIO_summary.empty() && options_.build_graph) {
     // create viewing graph with VIO
     LOG(INFO) << "Found VIO file.\n";
     CreateImageViewGraph(
       image_information, image_pairs, num_inliers, image_ids, image_cluster, vio_thresh);
-    LOG(INFO) << "FINISH HERE\n";
-    return;
     inter_clusters = ClusteringScenesWithViewGraph(image_cluster);
+
+  } else if (!VIO_summary.empty() && !options_.build_graph) {
+    LOG(INFO) << "Has VIO file, but don't build graph with it...\n";
+    inter_clusters = ClusteringScenes(image_pairs, num_inliers, image_ids);
   } else {
-    LOG(INFO) << "No VIO file found...\n";
+    LOG(INFO) << "No VIO file...\n";
     inter_clusters = ClusteringScenes(image_pairs, num_inliers, image_ids);
   }
+  */
+  // Build view graph with video sequence
+  CreateImageViewGraphWithVideo(
+    image_pairs, num_inliers, image_ids, image_cluster, video_frame_info,
+    image_id_to_name);
+  inter_clusters = ClusteringScenesWithViewGraph(image_cluster);
 
-  // std::unique_ptr<ImageClustering> image_clustering_;
 
   // ////////////////////////////////////////////////////////////////
   // // 2. Reconstruct all clusters in parallel/distributed manner //
@@ -255,6 +273,78 @@ void DistributedMapperController::LoadVIO(
 }
 
 
+void DistributedMapperController::LoadVideo(
+  std::vector<std::string>& video_paths)
+{
+  LOG(INFO) << "Loading videos\n";
+  namespace b_fs = boost::filesystem;
+  DIR *dr;
+  struct dirent *d;
+  dr = opendir(options_.video_folder_path.c_str());
+  b_fs::path dir (options_.video_folder_path);
+
+  // get all video folder
+  if (dr != NULL) {
+    for (d = readdir (dr); d != NULL; d = readdir(dr)) {
+      b_fs::path file (d->d_name);
+      if (file.string() == "." || file.string() == "..")
+          continue;
+      b_fs::path full_path = dir / file;
+      // LOG(INFO) << full_path.string() << std::endl;
+      video_paths.push_back(full_path.string());
+    }
+    closedir(dr);
+  }
+  for (const auto & video : video_paths) {
+    LOG(INFO) << "Video path: " << video << std::endl;
+  }
+}
+
+
+void DistributedMapperController::ParseVideoFrames(
+  std::vector<std::string>& video_paths,
+  std::unordered_map<image_t, GraphSfM::VideoInfo>& video_frame_info,
+  std::unordered_map<image_t, std::string>& image_id_to_name
+)
+{
+  LOG(INFO) << "Parsing video frames informations.\n";
+  for (const auto & it : image_id_to_name) {
+    // LOG(INFO) << "Parsing: " << it.second << std::endl;
+    image_t image_id = it.first;
+    std::string image_full_path = it.second;
+    std::string image_path;
+    std::string image_name;
+    ParseVideoFramePath(image_full_path, image_path, image_name);
+    for (size_t i = 0; i < video_paths.size(); ++i) {
+      std::string video_path = video_paths[i];
+      // LOG(INFO) << "Compare "
+      //           << video_path.substr(video_path.length()-image_path.length())
+      //           << std::endl;
+      if (image_path == 
+          video_path.substr(video_path.length()-image_path.length())) {
+        VideoInfo info = {i, std::stoi(image_name)};
+        video_frame_info.emplace(image_id, info);
+        break;
+      }
+    }
+  }
+}
+
+
+void DistributedMapperController::ParseVideoFramePath(
+  std::string& image_full_path,
+  std::string& image_path,
+  std::string& image_name
+)
+{
+  std::size_t found = image_full_path.find_last_of("/\\");
+  image_path = image_full_path.substr(0, found);
+  std::string image_full_name = image_full_path.substr(found+1);
+  found = image_full_path.find_last_of(".");
+  image_name = image_full_name.substr(0, found);
+}
+
+
 double DistributedMapperController::square_distance_3d(
   GraphSfM::Coordinate& coord1, GraphSfM::Coordinate& coord2
 )
@@ -419,17 +509,18 @@ int DistributedMapperController::ts_diff(std::string ts1, std::string ts2){
 }
 
 
-void DistributedMapperController::CreateImageViewGraph(
-  std::unordered_map<image_t, GraphSfM::ImageInfo>& image_information,
+void DistributedMapperController::CreateImageViewGraphWithVideo(
   std::vector<std::pair<image_t, image_t>>& image_pairs,
   std::vector<int>& num_inliers,
   std::vector<image_t>& image_ids,
   ImageCluster& image_cluster,
-  std::vector<GraphSfM::VIOThresh>& vio_thresh)
+  std::unordered_map<image_t, GraphSfM::VideoInfo>& video_frame_info,
+  std::unordered_map<image_t, std::string>& image_id_to_name
+)
 {
-  LOG(INFO) << "Creating view graph with VIO..." << std::endl;
-  // double coor_thresh; 
-  int ts_thresh = 30;
+  LOG(INFO) << "Creating view graph with video..." << std::endl;
+  //TODO: serial thresh should be different between different video sequences
+  int serial_thresh = 800;
 
   // collect all edges with weight
   std::unordered_map<ViewIdPair, int> edges;
@@ -447,6 +538,304 @@ void DistributedMapperController::CreateImageViewGraph(
     graph[node2].insert(node1);
   }
 
+  // memo of images added
+  std::set<image_t> image_added;
+
+  // 1. Consider edges which both vertices are in same video
+  LOG(INFO) << "Building view graph's arterial...\n";
+  LOG(INFO) << "Number of images in video sequences: "
+            << video_frame_info.size() << std::endl;
+  for (const auto & it1 : video_frame_info) {
+    for (const auto & it2 : video_frame_info) {
+      image_t image1 = it1.first;
+      image_t image2 = it2.first;
+      // Redundancy
+      if (image1 >= image2)
+        continue;
+      
+      // Two image are not in same video sequence
+      if (it1.second.video_id != it2.second.video_id)
+        continue;
+      
+      // No edge between these two image
+      if (graph[image1].find(image2) == graph[image1].end())
+        continue;
+
+      // Check serial num diff
+      if (abs(it1.second.serial_id - it2.second.serial_id) > serial_thresh)
+        continue;
+      
+      // Legal frame pair
+      ViewIdPair view_pair = std::make_pair(image1, image2);
+      image_cluster.edges[view_pair] = edges[view_pair];
+      if (image_added.find(image1) == image_added.end()) {
+        image_cluster.image_ids.push_back(image1);
+        image_added.insert(image1);
+      }
+      if (image_added.find(image2) == image_added.end()) {
+        image_cluster.image_ids.push_back(image2);
+        image_added.insert(image2);
+      }
+      image_cluster.graph[image1].insert(image2);
+      image_cluster.graph[image2].insert(image1);
+    }
+  }
+  // 2. Consider rest of edges
+  int image_remain = image_ids.size() - image_added.size();
+
+  // Map individual with it's closest serial id
+  std::unordered_map<image_t, GraphSfM::VideoInfo> closest_frame;
+  for (const auto & it : video_frame_info) {
+    closest_frame.emplace(it.first, it.second);
+  }
+
+  LOG(INFO) << "Add rest images into view graph, image nums: "
+            << image_remain << std::endl;
+  // TODO: make these two weight become parameters. 
+  double weight_vio = 1.0;
+  double weight_no_vio = 1.0;
+  // 2.1. Maintain heap for edge strength
+  struct ScoreInfo{
+    double score;
+    image_t reference;
+  };
+  struct HeapData{
+    image_t image_id;
+    image_t reference;
+    double score;
+  };
+  std::unordered_map<image_t, ScoreInfo> max_score;
+  std::vector<HeapData> edge_heap;
+
+  // Heap initialization
+  for (auto & image_id : image_ids) {
+    // Only consider images that are not added
+    if (image_added.find(image_id) != image_added.end())
+      continue;
+    double best_score = 0.0;
+    image_t best_ref;
+    for (auto ref_id : graph[image_id]) {
+      // Only consider reference images that are added
+      if (image_added.find(ref_id) == image_added.end())
+        continue;
+      double score = CalculateScore(
+        image_id, ref_id, edges, image_cluster.graph,
+        video_frame_info, weight_vio, weight_no_vio);
+      if (score > best_score) {
+        best_score = score;
+        best_ref = ref_id;
+      }
+    }
+    ScoreInfo best_info = {best_score, best_ref};
+    max_score.emplace(image_id, best_info);
+    HeapData heap_data = {image_id, best_ref, best_score};
+    edge_heap.push_back(heap_data);
+  }
+
+  const auto cmp_heap = [](const HeapData& info1, const HeapData& info2){
+    return info1.score < info2.score;
+  };
+  std::make_heap(edge_heap.begin(), edge_heap.end(), cmp_heap);
+
+  // 2.2. Always add the image with the largest score
+  while (!edge_heap.empty()) {
+    HeapData heap_top = edge_heap.front();
+    std::pop_heap(edge_heap.begin(), edge_heap.end(), cmp_heap);
+    edge_heap.pop_back();
+    // Deal with redundancy
+    if (image_added.find(heap_top.image_id) != image_added.end())
+      continue;
+    // LOG(INFO) << "Added image: " << heap_top.image_id << "---->"
+    //           << heap_top.reference << ", score: "
+    //           << heap_top.score << std::endl;
+    LOG(INFO) << "Added image: " << image_id_to_name[heap_top.image_id]
+              << "---->" << image_id_to_name[heap_top.reference]
+              << ", score: " << heap_top.score << std::endl;
+    closest_frame.emplace(heap_top.image_id,
+                          closest_frame[heap_top.reference]);
+    LOG(INFO) << "Remain image: " << --image_remain << std::endl;
+  /*
+    // for (const auto & neighbor : graph[heap_top.image_id]) {
+    //   // Only consider edges that the end point is added
+    //   if (image_added.find(neighbor) == image_added.end())
+    //     continue;
+    //   const ViewIdPair view_pair = heap_top.image_id < neighbor
+    //     ? std::make_pair(heap_top.image_id, neighbor)
+    //     : std::make_pair(neighbor, heap_top.image_id);
+    //   image_cluster.edges[view_pair] = 
+    //     images_with_vio.find(neighbor) == images_with_vio.end()
+    //     ? edges[view_pair] * weight_no_vio
+    //     : edges[view_pair] * weight_vio;
+    // }
+  */
+
+    // 2.2.1. Add image
+    image_cluster.image_ids.push_back(heap_top.image_id);
+    image_added.insert(heap_top.image_id);
+
+    // 2.2.2. Recursivly add edges to view graph
+    uint recursive_limit = 2;
+    struct QueueData {
+      image_t image_id;
+      uint recursive_time;
+    };
+    std::set<image_t> que_mem;
+    std::queue<QueueData> que;
+    // Init queue
+    for (const auto & ref_neighbor 
+         : image_cluster.graph[heap_top.reference]) {
+      if (que_mem.find(ref_neighbor) != que_mem.end())
+        continue;
+      QueueData que_data{ref_neighbor, 1};
+      que_mem.insert(ref_neighbor);
+      que.push(que_data);
+    }
+
+    while (!que.empty()) {
+      QueueData que_data = que.front();
+      que.pop();
+      image_t image_id = que_data.image_id;
+
+      // Stop if reach recursive limit
+      if (que_data.recursive_time > recursive_limit)
+        break;
+
+      // Only link to video frame in first round
+      // if (video_frame_info.find(image_id) != video_frame_info.end() &&
+      //     que_data.recursive_time > 1)
+      //   continue;
+      
+      // Check two images are not link to two serial images that are
+      // false match
+      if (closest_frame[heap_top.image_id].video_id ==
+          closest_frame[image_id].video_id &&
+          abs(closest_frame[heap_top.image_id].serial_id -
+              closest_frame[image_id].serial_id) > serial_thresh)
+        continue;
+
+      // Add edge
+      const ViewIdPair view_pair = heap_top.image_id < image_id
+        ? std::make_pair(heap_top.image_id, image_id)
+        : std::make_pair(image_id, heap_top.image_id);
+      image_cluster.edges[view_pair] = 
+        video_frame_info.find(image_id) == video_frame_info.end()
+        ? edges[view_pair] * weight_no_vio
+        : edges[view_pair] * weight_vio;
+      image_cluster.graph[image_id].insert(heap_top.image_id);
+      image_cluster.graph[heap_top.image_id].insert(image_id);
+      // Recursivly add neighbors if not reaching video image
+      // if (video_frame_info.find(image_id) != video_frame_info.end())
+      //   continue;
+
+      for (const auto & ref_neighbor : image_cluster.graph[image_id]) {
+        // Redundancy check
+        if (que_mem.find(ref_neighbor) != que_mem.end())
+          continue;
+        que_mem.insert(ref_neighbor);
+        QueueData new_neighbor = {ref_neighbor, que_data.recursive_time+1};
+        que.push(new_neighbor);
+      }
+    }
+  /*
+    // for (const auto & ref_neighbor : graph[heap_top.score_info.reference]) {
+    //   // Only consider edges that the end point is added
+    //   if (image_added.find(ref_neighbor) == image_added.end())
+    //     continue;
+    //   const ViewIdPair view_pair = heap_top.image_id < ref_neighbor
+    //     ? std::make_pair(heap_top.image_id, ref_neighbor)
+    //     : std::make_pair(ref_neighbor, heap_top.image_id);
+    //   image_cluster.edges[view_pair] = 
+    //     images_with_vio.find(ref_neighbor) == images_with_vio.end()
+    //     ? edges[view_pair] * weight_no_vio
+    //     : edges[view_pair] * weight_vio;
+    // }
+  */
+    // 2.2.3. Update
+    for (auto & image_id : image_ids) {
+      // Only consider images that are not added
+      if (image_added.find(image_id) != image_added.end())
+        continue;
+      // Check if need to update max score
+      bool updated = false;
+      std::set<image_t> ref_candidate = image_cluster.graph[heap_top.image_id];
+      ref_candidate.insert(heap_top.image_id);
+      for (auto ref_id : ref_candidate) {
+        double score = CalculateScore(
+            image_id, ref_id, edges, image_cluster.graph,
+            video_frame_info, weight_vio, weight_no_vio);
+        if (score > max_score[image_id].score) {
+          updated = true;
+          max_score[image_id].score = score;
+          max_score[image_id].reference = ref_id;
+        }
+      }
+      if (updated) {
+        HeapData heap_data = {image_id,
+                              max_score[image_id].reference,
+                              max_score[image_id].score};
+        edge_heap.push_back(heap_data);
+        std::push_heap(edge_heap.begin(), edge_heap.end(), cmp_heap);
+      }
+    }
+  }
+
+  // 3. Delete false positive feature matches in database
+  LOG(INFO) << "Delete false feature matches in database..." << std::endl;
+  Database database(options_.database_path);
+  for (uint i = 0; i < image_pairs.size(); ++i) {
+    image_t image_id1 = image_pairs[i].first;
+    image_t image_id2 = image_pairs[i].second;
+    const ViewIdPair view_pair(image_id1, image_id2);
+    if (image_cluster.edges.find(view_pair) == image_cluster.edges.end()) {
+      database.DeleteInlierMatches(image_id1, image_id2);
+      LOG(INFO) << "Delete inlier match: " << image_id1 << " " << image_id2 << std::endl;
+    }
+    // Delete matches if the closest serial id diff is larger than threshold
+    // if (abs(closest_frame[image_id1].serial_id -
+    //         closest_frame[image_id2].serial_id) > serial_thresh) {
+    //   database.DeleteInlierMatches(image_id1, image_id2);
+    //   LOG(INFO) << "Delete match: " << image_id1 << ": " << image_id_to_name[image_id1]
+    //             << " ----> " << image_id2 << ": " << image_id_to_name[image_id2]
+    //             << std::endl;
+    //   LOG(INFO) << "Closest: " << closest_frame[image_id1].serial_id << ", "
+    //             << closest_frame[image_id2].serial_id << std::endl;
+    // }
+  }
+
+  // Check graph completness
+  // LOG(INFO) << "Number of images in graph: " << image_cluster.image_ids.size() << std::endl;
+  // LOG(INFO) << "Number of images (total): " << image_ids.size() << std::endl;
+}
+
+
+void DistributedMapperController::CreateImageViewGraph(
+  std::unordered_map<image_t, GraphSfM::ImageInfo>& image_information,
+  std::vector<std::pair<image_t, image_t>>& image_pairs,
+  std::vector<int>& num_inliers,
+  std::vector<image_t>& image_ids,
+  ImageCluster& image_cluster,
+  std::vector<GraphSfM::VIOThresh>& vio_thresh)
+{
+  LOG(INFO) << "Creating view graph with VIO..." << std::endl;
+  // double coor_thresh;
+  // TODO: make ts_thresh a parameter.
+  int ts_thresh = 40;
+
+  // collect all edges with weight
+  std::unordered_map<ViewIdPair, int> edges;
+  for (size_t i = 0; i < image_pairs.size(); ++i) {
+    const ViewIdPair view_pair(image_pairs[i].first, image_pairs[i].second);
+    edges[view_pair] = num_inliers[i];
+  }
+
+  // collect all edges in bidirection
+  std::unordered_map<image_t, std::set<image_t>> graph;
+  for (size_t i = 0; i < image_pairs.size(); ++i) {
+    image_t node1 = image_pairs[i].first;
+    image_t node2 = image_pairs[i].second;
+    graph[node1].insert(node2);
+    graph[node2].insert(node1);
+  }
 
   // collect all image ids which has vio info
   std::set<image_t> images_with_vio;
@@ -460,23 +849,27 @@ void DistributedMapperController::CreateImageViewGraph(
 
   // 1. Consider edges which both vertices have VIO info
   LOG(INFO) << "Building view graph's arterial..." << std::endl;
+  LOG(INFO) << "Number of images with VIO: " << images_with_vio.size()
+            << std::endl;
   for (const auto & image1 : images_with_vio) {
     for (const auto & image2 : images_with_vio) {
       // redundant, assure id1 < id2
       if (image1 >= image2)
         continue;
 
-      // Same image or two images not in same ts range
+      // Two images not in same ts range
       if (image_information[image1].VIO_info.VIO_group_id !=
           image_information[image2].VIO_info.VIO_group_id)
         continue;
 
-      const ViewIdPair view_pair(image1, image2);
-      if (edges.find(view_pair) == edges.end())
+      // No edge between image1 and image2
+      if (graph[image1].find(image2) == graph[image1].end())
         continue;
+
       // Check ts diff between two image
       if (ts_diff(image_information[image1].image_name,
                   image_information[image2].image_name) <= ts_thresh) {
+        ViewIdPair view_pair = std::make_pair(image1, image2);
         image_cluster.edges[view_pair] = edges[view_pair];
         if (image_added.find(image1) == image_added.end()) {
           image_cluster.image_ids.push_back(image1);
@@ -486,12 +879,15 @@ void DistributedMapperController::CreateImageViewGraph(
           image_cluster.image_ids.push_back(image2);
           image_added.insert(image2);
         }
+        image_cluster.graph[image1].insert(image2);
+        image_cluster.graph[image2].insert(image1);
       }
 
       // Consider drift thresh and height thresh
       GraphSfM::Coordinate coord1 = image_information[image1].VIO_info.coordinate;
       GraphSfM::Coordinate coord2 = image_information[image2].VIO_info.coordinate;
       uint group_id = image_information[image1].VIO_info.VIO_group_id;
+    /*
       // if (square_distance_3d(coord1, coord2) <= vio_thresh[group_id].drift_thresh ||
       //         abs(coord1.y - coord2.y) <= vio_thresh[group_id].height_thresh){
       // if (square_distance_3d(coord1, coord2) <= vio_thresh[group_id].drift_thresh){
@@ -507,47 +903,17 @@ void DistributedMapperController::CreateImageViewGraph(
       //         image_added.insert(image2);
       //     }
       // }
+    */
     }
   }
+
   // 2. Consider rest of edges
   int image_remain = image_ids.size() - image_added.size();
   LOG(INFO) << "Add rest images into view graph, image nums: "
             << image_remain << std::endl;
+  // TODO: make these two weight become parameters. 
   double weight_vio = 1.0;
-  double weight_no_vio = 0.8;
-  // while (image_remain > 0){
-  //     LOG(INFO) << "remain image num: " << image_remain << std::endl;
-  //     double best_score = 0.0;
-  //     image_t best_id;
-  //     for (auto & image_id : image_ids){
-  //         // check if image is already in graph
-  //         if (image_added.find(image_id) != image_added.end())
-  //             continue;
-  //         double cur_score;
-  //         cur_score = CalculateScore(
-  //             image_id, image_added, edges, graph, images_with_vio, weight_vio, weight_no_vio);
-  //         if (cur_score > best_score){
-  //             best_score = cur_score;
-  //             best_id = image_id;
-  //         }
-  //     }
-  //     LOG(INFO) << "Add image score: " << best_score << std::endl;
-  //     // add all edges from best_id image to images that are in graph already
-  //     // weight the edges depends on the reference image has VIO or not
-  //     for (auto & neighbor : graph[best_id]){
-  //         if (image_added.find(neighbor) == image_added.end())
-  //             continue;
-  //         const ViewIdPair view_pair = (best_id < neighbor) ?
-  //             std::make_pair(best_id, neighbor) : std::make_pair(neighbor, best_id);
-  //         image_cluster.edges[view_pair] =
-  //             (images_with_vio.find(neighbor) == images_with_vio.end())?
-  //             edges[view_pair] * weight_no_vio : edges[view_pair] * weight_vio;
-  //     }
-  //     // add image to graph
-  //     image_cluster.image_ids.push_back(best_id);
-  //     image_added.insert(best_id);
-  //     image_remain--;
-  // }
+  double weight_no_vio = 0.5;
 
   // 2.1. Maintain heap for edge strength
   struct ScoreInfo{
@@ -556,11 +922,13 @@ void DistributedMapperController::CreateImageViewGraph(
   };
   struct HeapData{
     image_t image_id;
-    ScoreInfo score_info;
+    image_t reference;
+    double score;
   };
   std::unordered_map<image_t, ScoreInfo> max_score;
   std::vector<HeapData> edge_heap;
-    
+
+  // Heap initialization
   for (auto & image_id : image_ids) {
     // Only consider images that are not added
     if (image_added.find(image_id) != image_added.end())
@@ -572,7 +940,7 @@ void DistributedMapperController::CreateImageViewGraph(
       if (image_added.find(ref_id) == image_added.end())
         continue;
       double score = CalculateScore(
-        image_id, ref_id, image_added, edges, graph,
+        image_id, ref_id, edges, image_cluster.graph,
         images_with_vio, weight_vio, weight_no_vio);
       if (score > best_score) {
         best_score = score;
@@ -581,12 +949,12 @@ void DistributedMapperController::CreateImageViewGraph(
     }
     ScoreInfo best_info = {best_score, best_ref};
     max_score.emplace(image_id, best_info);
-    HeapData heap_data = {image_id, best_info};
+    HeapData heap_data = {image_id, best_ref, best_score};
     edge_heap.push_back(heap_data);
   }
 
   const auto cmp_heap = [](const HeapData& info1, const HeapData& info2){
-    return info1.score_info.score < info2.score_info.score;
+    return info1.score < info2.score;
   };
   std::make_heap(edge_heap.begin(), edge_heap.end(), cmp_heap);
 
@@ -598,26 +966,92 @@ void DistributedMapperController::CreateImageViewGraph(
     // Deal with redundancy
     if (image_added.find(heap_top.image_id) != image_added.end())
       continue;
-
-    // 2.2.1. Add edges to view grpah
-    LOG(INFO) << "Added image " << heap_top.image_id 
-              << " with score: " << heap_top.score_info.score << std::endl;
-    for (const auto & neighbor : graph[heap_top.image_id]) {
-      // Only consider edges that the end point is added
-      if (image_added.find(neighbor) == image_added.end())
-        continue;
-      const ViewIdPair view_pair = heap_top.image_id < neighbor
-        ? std::make_pair(heap_top.image_id, neighbor)
-        : std::make_pair(neighbor, heap_top.image_id);
-      image_cluster.edges[view_pair] = 
-        images_with_vio.find(neighbor) == images_with_vio.end()
-        ? edges[view_pair] * weight_no_vio
-        : edges[view_pair] * weight_vio;
+    if (images_with_vio.find(heap_top.reference) != images_with_vio.end()) {
+      LOG(INFO) << "Added image: " << heap_top.image_id << "---->"
+                << heap_top.reference << "(VIO), score: "
+                << heap_top.score << std::endl;
+    } else {
+      LOG(INFO) << "Added image: " << heap_top.image_id << "---->"
+                << heap_top.reference << "     , score: "
+                << heap_top.score << std::endl;
     }
-    // 2.2.2. Add image
+    --image_remain;
+  /*
+    // for (const auto & neighbor : graph[heap_top.image_id]) {
+    //   // Only consider edges that the end point is added
+    //   if (image_added.find(neighbor) == image_added.end())
+    //     continue;
+    //   const ViewIdPair view_pair = heap_top.image_id < neighbor
+    //     ? std::make_pair(heap_top.image_id, neighbor)
+    //     : std::make_pair(neighbor, heap_top.image_id);
+    //   image_cluster.edges[view_pair] = 
+    //     images_with_vio.find(neighbor) == images_with_vio.end()
+    //     ? edges[view_pair] * weight_no_vio
+    //     : edges[view_pair] * weight_vio;
+    // }
+  */
+
+    // 2.2.1. Add image
     image_cluster.image_ids.push_back(heap_top.image_id);
     image_added.insert(heap_top.image_id);
 
+    // 2.2.2. Recursivly add edges to view graph
+    uint recursive_limit = 2;
+    struct QueueData {
+      image_t image_id;
+      uint recursive_time;
+    };
+    std::set<image_t> que_mem;
+    std::queue<QueueData> que;
+    // Init queue
+    for (const auto & ref_neighbor 
+         : image_cluster.graph[heap_top.reference]) {
+      if (que_mem.find(ref_neighbor) != que_mem.end())
+        continue;
+      QueueData que_data{ref_neighbor, 1};
+      que_mem.insert(ref_neighbor);
+      que.push(que_data);
+    }
+
+    while (!que.empty()) {
+      QueueData que_data = que.front();
+      que.pop();
+      if (que_data.recursive_time > recursive_limit)
+        break;
+      image_t image_id = que_data.image_id;
+      const ViewIdPair view_pair = heap_top.image_id < image_id
+        ? std::make_pair(heap_top.image_id, image_id)
+        : std::make_pair(image_id, heap_top.image_id);
+      image_cluster.edges[view_pair] = 
+        images_with_vio.find(image_id) == images_with_vio.end()
+        ? edges[view_pair] * weight_no_vio
+        : edges[view_pair] * weight_vio;
+      image_cluster.graph[image_id].insert(heap_top.image_id);
+      image_cluster.graph[heap_top.image_id].insert(image_id);
+      // Recursivly add neighbors
+      for (const auto & ref_neighbor : image_cluster.graph[image_id]) {
+        // Redundancy check
+        if (que_mem.find(ref_neighbor) != que_mem.end())
+          continue;
+        que_mem.insert(ref_neighbor);
+        QueueData new_neighbor = {ref_neighbor, que_data.recursive_time+1};
+        que.push(new_neighbor);
+      }
+    }
+  /*
+    // for (const auto & ref_neighbor : graph[heap_top.score_info.reference]) {
+    //   // Only consider edges that the end point is added
+    //   if (image_added.find(ref_neighbor) == image_added.end())
+    //     continue;
+    //   const ViewIdPair view_pair = heap_top.image_id < ref_neighbor
+    //     ? std::make_pair(heap_top.image_id, ref_neighbor)
+    //     : std::make_pair(ref_neighbor, heap_top.image_id);
+    //   image_cluster.edges[view_pair] = 
+    //     images_with_vio.find(ref_neighbor) == images_with_vio.end()
+    //     ? edges[view_pair] * weight_no_vio
+    //     : edges[view_pair] * weight_vio;
+    // }
+  */
     // 2.2.3. Update
     for (auto & image_id : image_ids) {
       // Only consider images that are not added
@@ -625,11 +1059,11 @@ void DistributedMapperController::CreateImageViewGraph(
         continue;
       // Check if need to update max score
       bool updated = false;
-      std::set<image_t> ref_candidate = graph[heap_top.image_id];
+      std::set<image_t> ref_candidate = image_cluster.graph[heap_top.image_id];
       ref_candidate.insert(heap_top.image_id);
       for (auto ref_id : ref_candidate) {
         double score = CalculateScore(
-            image_id, ref_id, image_added, edges, graph,
+            image_id, ref_id, edges, image_cluster.graph,
             images_with_vio, weight_vio, weight_no_vio);
         if (score > max_score[image_id].score) {
           updated = true;
@@ -638,12 +1072,16 @@ void DistributedMapperController::CreateImageViewGraph(
         }
       }
       if (updated) {
-        HeapData heap_data = {image_id, max_score[image_id]};
+        HeapData heap_data = {image_id,
+                              max_score[image_id].reference,
+                              max_score[image_id].score};
         edge_heap.push_back(heap_data);
         std::push_heap(edge_heap.begin(), edge_heap.end(), cmp_heap);
       }
     }
   }
+
+  // image_cluster.graph = graph;
 
   // 3. Delete false positive feature matches in database
   LOG(INFO) << "Delete false feature matches in database..." << std::endl;
@@ -667,37 +1105,76 @@ void DistributedMapperController::CreateImageViewGraph(
 double DistributedMapperController::CalculateScore(
   image_t& image_id,
   image_t& ref_id,
-  std::set<image_t>& image_added,
   std::unordered_map<ViewIdPair, int>& edges,
   std::unordered_map<image_t, std::set<image_t>>& graph,
   std::set<image_t>& images_with_vio,
   double& weight_vio, double& weight_no_vio)
 {
+  const ViewIdPair vp = image_id < ref_id
+    ? std::make_pair(image_id, ref_id)
+    : std::make_pair(ref_id, image_id);
+  return edges[vp];
   std::vector<image_t> ref_images;
   ref_images.push_back(ref_id);
   // Find all neighbors as reference images
   for (const auto & neighbor : graph[ref_id]) {
-    // Only consider neighbors which are added
-    if (image_added.find(neighbor) != image_added.end()) {
-      ref_images.push_back(neighbor);
-    }
+    ref_images.push_back(neighbor);
   }
   // Calculate mean weighted sum of reference images
   double score = 0.0;
   uint edge_count = 0;
   for (const auto & ref_image : ref_images) {
     const ViewIdPair view_pair = image_id < ref_image
-        ? std::make_pair(image_id, ref_image)
-        : std::make_pair(ref_image, image_id);
+      ? std::make_pair(image_id, ref_image)
+      : std::make_pair(ref_image, image_id);
     if (edges.find(view_pair) != edges.end()) {
       edge_count++;
       score += images_with_vio.find(ref_image) == images_with_vio.end()
+        ? edges[view_pair] * weight_no_vio : edges[view_pair] * weight_vio;
+      
+    }
+  }
+  score /= edge_count;
+  return score;
+}
+
+double DistributedMapperController::CalculateScore(
+  image_t& image_id,
+  image_t& ref_id,
+  std::unordered_map<ViewIdPair, int>& edges,
+  std::unordered_map<image_t, std::set<image_t>>& graph,
+  std::unordered_map<image_t, GraphSfM::VideoInfo>& video_frame_info,
+  double& weight_vio, double& weight_no_vio
+)
+{
+  const ViewIdPair vp = image_id < ref_id
+    ? std::make_pair(image_id, ref_id)
+    : std::make_pair(ref_id, image_id);
+  return edges[vp];
+  std::vector<image_t> ref_images;
+  ref_images.push_back(ref_id);
+  // Find all neighbors as reference images
+  for (const auto & neighbor : graph[ref_id]) {
+    ref_images.push_back(neighbor);
+  }
+  // Calculate mean weighted sum of reference images
+  double score = 0.0;
+  uint edge_count = 0;
+  for (const auto & ref_image : ref_images) {
+    const ViewIdPair view_pair = image_id < ref_image
+      ? std::make_pair(image_id, ref_image)
+      : std::make_pair(ref_image, image_id);
+    if (edges.find(view_pair) != edges.end()) {
+      edge_count++;
+      score += video_frame_info.find(ref_image) == video_frame_info.end()
         ? edges[view_pair] * weight_no_vio : edges[view_pair] * weight_vio;
     }
   }
   score /= edge_count;
   return score;
 }
+
+
 
 
 std::vector<ImageCluster> DistributedMapperController::ClusteringScenes(

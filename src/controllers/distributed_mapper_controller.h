@@ -41,6 +41,11 @@ struct VIOThresh
     double height_thresh;
     double drift_thresh;
 };
+struct VideoInfo
+{
+    uint video_id;
+    int serial_id;
+};
 
 // Distributed mapping for very large scale structure from motion.
 // This mapper first partition images into the given number of clusters, 
@@ -58,17 +63,23 @@ public:
         // The path to store reconstructions.
         std::string output_path;
 
-        // The path to the database file which is used as input
+        // The path to the database file which is used as input.
         std::string database_path;
 
         // The maximum number of trials to initialize a cluster.
         int init_num_trials = 10;
 
-        // The number of workers used to reconstruct clusters in parallel
+        // The number of workers used to reconstruct clusters in parallel.
         int num_workers = -1;
 
-        // The path to the folder of imu information file which is used as input
+        // The path to the folder of imu information file which is used as input.
         std::string VIO_folder_path;
+
+        // The path to the folder of video sequences.
+        std::string video_folder_path;
+
+        // If need to build view graph with VIO
+        bool build_graph = true;
 
         bool Check() const;
     };
@@ -93,6 +104,20 @@ private:
 
     void LoadVIO(std::vector<std::vector<std::pair<std::string, GraphSfM::Coordinate>>>& ts_to_VIO,
                  std::vector<std::pair<std::string, std::string>>& VIO_summary);
+    
+    void LoadVideo(std::vector<std::string>& video_paths);
+
+    void ParseVideoFrames(
+        std::vector<std::string>& video_paths,
+        std::unordered_map<image_t, GraphSfM::VideoInfo>& video_frame_info,
+        std::unordered_map<image_t, std::string>& image_id_to_name
+    );
+
+    void ParseVideoFramePath(
+        std::string& image_full_path,
+        std::string& image_path,
+        std::string& image_name
+    );
 
     void CalculateVIOThresh(
         std::vector<GraphSfM::VIOThresh>& vio_thresh,
@@ -122,10 +147,18 @@ private:
     double CalculateScore(
         image_t& image_id,
         image_t& ref_id,
-        std::set<image_t>& image_added,
         std::unordered_map<ViewIdPair, int>& edges,
         std::unordered_map<image_t, std::set<image_t>>& graph,
         std::set<image_t>& images_with_vio,
+        double& weight_vio, double& weight_no_vio
+    );
+
+    double CalculateScore(
+        image_t& image_id,
+        image_t& ref_id,
+        std::unordered_map<ViewIdPair, int>& edges,
+        std::unordered_map<image_t, std::set<image_t>>& graph,
+        std::unordered_map<image_t, GraphSfM::VideoInfo>& video_frame_info,
         double& weight_vio, double& weight_no_vio
     );
 
@@ -137,6 +170,13 @@ private:
         ImageCluster& image_cluster,
         std::vector<GraphSfM::VIOThresh>& vio_thresh);
 
+    void CreateImageViewGraphWithVideo(
+        std::vector<std::pair<image_t, image_t>>& image_pairs,
+        std::vector<int>& num_inliers,
+        std::vector<image_t>& image_ids,
+        ImageCluster& image_cluster,
+        std::unordered_map<image_t, GraphSfM::VideoInfo>& video_frame_info,
+        std::unordered_map<image_t, std::string>& image_id_to_name);
 
     std::vector<ImageCluster> ClusteringScenes(
         const std::vector<std::pair<image_t, image_t>>& image_pairs,

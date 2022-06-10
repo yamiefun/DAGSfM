@@ -25,6 +25,7 @@ struct ImageCluster
     std::vector<image_t> image_ids;
     Edges edges;
     bool is_condition_satisfy = false;
+    std::unordered_map<image_t, std::set<image_t>> graph;
 
     // ImageCluster(const ImageCluster& image_cluster)
     // {
@@ -58,7 +59,7 @@ public:
         uint num_images_ub = 100;
 
         // The number of overlapping images between child clusters.
-        uint image_overlap = 50;
+        uint image_overlap = 130;
 
         // completeness ratio for selecting expanded clusters
         float completeness_ratio = 0.5;
@@ -162,6 +163,10 @@ private:
     void AddLostEdgesBetweenClusters(ImageCluster& cluster1,
                                      ImageCluster& cluster2,
                                      std::vector<graph::Edge>& lost_edges);
+
+    void AddMoreCommnoImages(ImageCluster& cluster1,
+                             ImageCluster& cluster2,
+                             int remain_num);
 
     void AnalyzeStatistic();
 };

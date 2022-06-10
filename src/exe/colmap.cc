@@ -1001,6 +1001,8 @@ int RunDistributedMapper(int argc, char** argv)
     options.AddDefaultOption("cluster_type", &clustering_options.cluster_type);
     options.AddDefaultOption("graph_dir", &clustering_options.graph_dir);
     options.AddDefaultOption("imu", &distributed_options.VIO_folder_path);
+    options.AddDefaultOption("video", &distributed_options.video_folder_path);
+    options.AddDefaultOption("build_graph", &distributed_options.build_graph);
     options.AddMapperOptions();
     options.Parse(argc, argv);
 

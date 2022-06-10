@@ -32,8 +32,11 @@ ImageClustering::ImageClustering(const Options& options,
 void ImageClustering::Cut()
 {
     timer_.Start();
-    const uint num_clusters = root_cluster_.image_ids.size() / options_.num_images_ub;
-    CHECK_GE(num_clusters, 1);
+    // const uint num_clusters = root_cluster_.image_ids.size() / options_.num_images_ub;
+    uint num_clusters = root_cluster_.image_ids.size() / options_.num_images_ub;
+    // lazy
+    const uint kNumClusters = (num_clusters == 0) ? 1 : num_clusters;
+    // CHECK_GE(num_clusters, 1);
 
     std::vector<std::pair<int, int>> image_pairs;
     std::vector<int> weights;
@@ -48,20 +51,20 @@ void ImageClustering::Cut()
     LOG(INFO) << "Images Clustering Started ";
     const std::unique_ptr<Cluster> cluster = this->CreateCluster();
     CHECK_NOTNULL(cluster.get());
-    LOG(INFO) << "cluster num: " << num_clusters;
+    LOG(INFO) << "cluster num: " << kNumClusters;
 
     // labels: image_id -> cluster_id
     std::unordered_map<int, int> labels = 
-        cluster->ComputeCluster(image_pairs, weights, num_clusters);
+        cluster->ComputeCluster(image_pairs, weights, kNumClusters);
 
     LOG(INFO) << "Cutting Complete, grouping images...";
 
     // Collect nodes according to the partition result
-    intra_clusters_.resize(num_clusters);
+    intra_clusters_.resize(kNumClusters);
     for (const auto label : labels) {
         intra_clusters_[label.second].image_ids.push_back(label.first);
     }
-    for (uint i = 0; i < intra_clusters_.size(); i++) {
+    for (size_t i = 0; i < intra_clusters_.size(); i++) {
         intra_clusters_[i].cluster_id = i;
     }
 
@@ -93,20 +96,37 @@ void ImageClustering::Expand()
 {
     LOG(INFO) << "Expanding Images...";
 
-    const uint num_clusters = intra_clusters_.size();
-    inter_clusters_.reserve(num_clusters);
+    const size_t kNumClusters = intra_clusters_.size();
+    inter_clusters_.reserve(kNumClusters);
     for (auto cluster : intra_clusters_) {
-         inter_clusters_.emplace_back(cluster);
+        inter_clusters_.emplace_back(cluster);
     }
 
     timer_.Start();
-    if (num_clusters > 1) {
+    if (kNumClusters > 1) {
         for (auto it : clusters_lost_edges_) {
             const ViewIdPair cluster_pair = it.first;
             std::vector<graph::Edge> lost_edges = it.second;
             ImageCluster& cluster1 = inter_clusters_[cluster_pair.first];
             ImageCluster& cluster2 = inter_clusters_[cluster_pair.second];
+            LOG(INFO) << "Add lost edges between cluster " << cluster_pair.first
+                      << " and cluster " << cluster_pair.second << std::endl;
+            LOG(INFO) << "Number of lost edges: " << lost_edges.size() << std::endl;
+
             AddLostEdgesBetweenClusters(cluster1, cluster2, lost_edges);
+            uint common_images_num = CommonImagesNum(cluster1, cluster2);
+            LOG(INFO) << "Common image num between " << cluster_pair.first << " and "
+                      << cluster_pair.second << ": " << common_images_num << std::endl;
+
+            // Add more image if common images are not enough
+            if (common_images_num < options_.image_overlap) {
+                LOG(INFO) << "Common images are not enough, try to add more images.\n";
+                AddMoreCommnoImages(cluster1, cluster2, 
+                                    options_.image_overlap - common_images_num);
+                common_images_num = CommonImagesNum(cluster1, cluster2);
+                LOG(INFO) << "Common image num between " << cluster_pair.first << " and "
+                          << cluster_pair.second << ": " << common_images_num << std::endl;
+            }
         }
     }
 
@@ -402,37 +422,190 @@ void ImageClustering::AddLostEdgesBetweenClusters(ImageCluster& cluster1,
     std::sort(lost_edges.begin(), lost_edges.end(), cmp);
 
     RandomNumberGenerator rng;
-    for (uint k = 0; k < options_.image_overlap && k < lost_edges.size(); k++) {
-        const ViewIdPair view_pair = lost_edges[k].src < lost_edges[k].dst
-                                     ? ViewIdPair(lost_edges[k].src, lost_edges[k].dst)
-                                     : ViewIdPair(lost_edges[k].dst, lost_edges[k].src);
+    std::unordered_set<image_t> images1(cluster1.image_ids.begin(), 
+                                        cluster1.image_ids.end());
+    std::unordered_set<image_t> images2(cluster2.image_ids.begin(),
+                                        cluster2.image_ids.end());
 
-        const std::unordered_set<image_t> images1(cluster1.image_ids.begin(), 
-                                                  cluster1.image_ids.end());
-        const std::unordered_set<image_t> images2(cluster2.image_ids.begin(),
-                                                  cluster2.image_ids.end());
-        
-        const image_t added_image1 = images1.find(lost_edges[k].src) == images1.end()
-                                     ? lost_edges[k].src : lost_edges[k].dst;
-        const image_t added_image2 = images2.find(lost_edges[k].src) == images2.end()
-                                     ? lost_edges[k].src : lost_edges[k].dst;
+    // for (uint k = 0; k < options_.image_overlap && k < lost_edges.size(); ++k) {
+    for (uint k = 0; k < lost_edges.size(); ++k) {
+        LOG(INFO) << "Add lost edge, round: " << k << std::endl;
+        const image_t image1 = lost_edges[k].src;
+        const image_t image2 = lost_edges[k].dst;
 
-        int selected_image = cluster1.image_ids.size() > cluster2.image_ids.size() ? 2 : 1;
-        if (selected_image == 1) {
-            if (!IsSatisfyCompletenessRatio(cluster1) && 
-                images1.find(added_image1) == images1.end()) {
-                cluster1.image_ids.push_back(added_image1);
-                cluster1.edges[view_pair] = lost_edges[k].weight;
-            }
-        } else {
-            if (!IsSatisfyCompletenessRatio(cluster2)  && 
-                images2.find(added_image2) == images2.end()) {
-                cluster2.image_ids.push_back(added_image2);
-                cluster2.edges[view_pair] = lost_edges[k].weight;
-            }
+        const ViewIdPair view_pair = image1 < image2
+                                     ? ViewIdPair(image1, image2)
+                                     : ViewIdPair(image2, image1);
+        const image_t added_image1 = images1.find(image1) == images1.end()
+                                     ? image1 : image2;
+        const image_t added_image2 = images2.find(image1) == images2.end()
+                                     ? image1 : image2;
+        LOG(INFO) << "Image1: " << added_image1 << ", Image2: " << added_image2 << std::endl;
+
+        // Add image to cluster 1
+        if (images1.find(added_image1) == images1.end()){
+            cluster1.image_ids.push_back(added_image1);
+            images1.insert(added_image1);
+            cluster1.edges[view_pair] = lost_edges[k].weight;
+            LOG(INFO) << "Add image " << added_image1 << " into cluster1\n";
+        }
+
+        // Add image to cluster 2
+        if (images2.find(added_image2) == images2.end()){
+            cluster2.image_ids.push_back(added_image2);
+            images2.insert(added_image2);
+            cluster2.edges[view_pair] = lost_edges[k].weight;
+            LOG(INFO) << "Add image " << added_image2 << " into cluster2\n";
         }
     }
 }
+
+void ImageClustering::AddMoreCommnoImages(ImageCluster& cluster1,
+                                          ImageCluster& cluster2,
+                                          int remain_num)
+{
+    std::unordered_set<image_t> images1(cluster1.image_ids.begin(), 
+                                        cluster1.image_ids.end());
+    std::unordered_set<image_t> images2(cluster2.image_ids.begin(),
+                                        cluster2.image_ids.end());
+    std::unordered_set<image_t> common_images;
+    std::unordered_set<image_t> all_images;
+    std::unordered_map<image_t, std::set<image_t>> graph = root_cluster_.graph;
+    std::unordered_map<ViewIdPair, int> edges = root_cluster_.edges;
+
+    for (const auto & image_id : images1) {
+        if (images2.find(image_id) != images2.end())
+            common_images.insert(image_id);
+    }
+
+    all_images.insert(images1.begin(), images1.end());
+    all_images.insert(images2.begin(), images2.end());
+
+    struct HeapData{
+        image_t image_id;
+        image_t ref_image_id;
+        int weight;
+    };
+    const auto cmp_heap = [](const HeapData& info1, const HeapData& info2){
+        return info1.weight < info2.weight;
+    };
+    std::vector<HeapData> candidate_image;
+    for (const auto & image_id : common_images) {
+        for (const auto & neighbor : graph[image_id]) {
+            // Only consider neighbor that is in cluster1 or 2
+            if (all_images.find(neighbor) == all_images.end())
+                continue;
+            if (image_id == neighbor)
+                continue;
+            const ViewIdPair view_pair = image_id < neighbor
+                ? std::make_pair(image_id, neighbor)
+                : std::make_pair(neighbor, image_id);
+            HeapData heap_data = {neighbor, image_id, edges[view_pair]};
+            candidate_image.push_back(heap_data);
+            std::push_heap(candidate_image.begin(), candidate_image.end(), cmp_heap);
+        }
+    }
+
+    while (!candidate_image.empty() && remain_num > 0) {
+        HeapData heap_top = candidate_image.front();
+        std::pop_heap(candidate_image.begin(), candidate_image.end(), cmp_heap);
+        candidate_image.pop_back();
+        // Deal with redundancy
+        if (common_images.find(heap_top.image_id) != common_images.end())
+            continue;
+        const ViewIdPair view_pair = heap_top.image_id < heap_top.ref_image_id
+            ? std::make_pair(heap_top.image_id, heap_top.ref_image_id)
+            : std::make_pair(heap_top.ref_image_id, heap_top.image_id);
+
+        if (images1.find(heap_top.image_id) == images1.end()) {
+            images1.insert(heap_top.image_id);
+            cluster1.image_ids.push_back(heap_top.image_id);
+            cluster1.edges[view_pair] = heap_top.weight;
+            LOG(INFO) << "Add image " << heap_top.image_id << " into cluster1\n";
+        } else {
+            images2.insert(heap_top.image_id);
+            cluster2.image_ids.push_back(heap_top.image_id);
+            cluster2.edges[view_pair] = heap_top.weight;
+            LOG(INFO) << "Add image " << heap_top.image_id << " into cluster2\n";
+        }
+        common_images.insert(heap_top.image_id);
+        remain_num--;
+
+        for (const auto & new_candidate : graph[heap_top.image_id]) {
+            // Deal with redundancy
+            if (common_images.find(new_candidate) != common_images.end())
+                continue;
+            const ViewIdPair view_pair = heap_top.image_id < new_candidate
+                ? std::make_pair(heap_top.image_id, new_candidate)
+                : std::make_pair(new_candidate, heap_top.image_id);
+            HeapData heap_data = {new_candidate, heap_top.image_id, edges[view_pair]};
+            candidate_image.push_back(heap_data);
+            std::push_heap(candidate_image.begin(), candidate_image.end(), cmp_heap);
+        }
+    }
+}
+
+
+// void ImageClustering::AddLostEdgesBetweenClusters(ImageCluster& cluster1,
+//                                  ImageCluster& cluster2,
+//                                  std::vector<graph::Edge>& lost_edges)
+// {
+//     if (IsSatisfyCompletenessRatio(cluster1) && 
+//         IsSatisfyCompletenessRatio(cluster2)) {
+//         return;
+//     }
+
+//     const auto cmp = [](const graph::Edge& edge1, const graph::Edge& edge2) {
+//         return edge1.weight > edge2.weight;
+//     };
+//     std::sort(lost_edges.begin(), lost_edges.end(), cmp);
+
+//     RandomNumberGenerator rng;
+//     std::unordered_set<image_t> images1(cluster1.image_ids.begin(), 
+//                                         cluster1.image_ids.end());
+//     std::unordered_set<image_t> images2(cluster2.image_ids.begin(),
+//                                         cluster2.image_ids.end());
+//     for (uint k = 0; k < options_.image_overlap && k < lost_edges.size(); ++k) {
+//         LOG(INFO) << "Add lost edge, round: " << k << std::endl;
+//         const ViewIdPair view_pair = lost_edges[k].src < lost_edges[k].dst
+//                                      ? ViewIdPair(lost_edges[k].src, lost_edges[k].dst)
+//                                      : ViewIdPair(lost_edges[k].dst, lost_edges[k].src);
+//         const image_t added_image1 = images1.find(lost_edges[k].src) == images1.end()
+//                                      ? lost_edges[k].src : lost_edges[k].dst;
+//         const image_t added_image2 = images2.find(lost_edges[k].src) == images2.end()
+//                                      ? lost_edges[k].src : lost_edges[k].dst;
+//         LOG(INFO) << "Image1: " << added_image1 << ", Image2: " << added_image2 << std::endl;
+//         // Add image to smaller cluster
+//         int selected_image = cluster1.image_ids.size() <= cluster2.image_ids.size() ? 1 : 2;
+//         if (selected_image == 1) {
+//             if (!IsSatisfyCompletenessRatio(cluster1) && 
+//                 images1.find(added_image1) == images1.end()) {
+//                 cluster1.image_ids.push_back(added_image1);
+//                 images1.insert(added_image1);
+//                 cluster1.edges[view_pair] = lost_edges[k].weight;
+//                 LOG(INFO) << "Add image " << added_image1 << " into cluster1\n";
+//             } else {
+//                 if (images1.find(added_image1) != images1.end()){
+//                     LOG(INFO) << "Not add image because image " << added_image1
+//                     << " is already in cluster1.\n";
+//                 }
+//             }
+//         } else {
+//             if (!IsSatisfyCompletenessRatio(cluster2) && 
+//                 images2.find(added_image2) == images2.end()) {
+//                 cluster2.image_ids.push_back(added_image2);
+//                 images2.insert(added_image2);
+//                 cluster2.edges[view_pair] = lost_edges[k].weight;
+//                 LOG(INFO) << "Add image " << added_image2 << " into cluster2\n";
+//             } else {
+//                 if (images2.find(added_image1) != images2.end()){
+//                     LOG(INFO) << "Not add image because image " << added_image2
+//                     << " is already in cluster2.\n";
+//                 }
+//             }
+//         }
+//     }
+// }
 
 void ImageClustering::AnalyzeStatistic()
 {
