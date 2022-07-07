@@ -16,6 +16,7 @@
 #include <dirent.h>
 #include <set>
 #include <queue>
+#include <climits>
 
 using namespace colmap;
 
@@ -65,6 +66,7 @@ void DistributedMapperController::Run()
 
   std::vector<std::string> video_paths;
   LoadVideo(video_paths);
+  size_t video_num = video_paths.size();
   std::unordered_map<image_t, GraphSfM::VideoInfo> video_frame_info;
   ParseVideoFrames(video_paths, video_frame_info, image_id_to_name);
   // LOG(INFO) << "STOP HERE\n";
@@ -99,9 +101,12 @@ void DistributedMapperController::Run()
   }
   */
   // Build view graph with video sequence
-  CreateImageViewGraphWithVideo(
+  CreateImageViewGraphWithVideos(
     image_pairs, num_inliers, image_ids, image_cluster, video_frame_info,
-    image_id_to_name);
+    image_id_to_name, video_num);
+  // CreateImageViewGraphWithVideo(
+  //   image_pairs, num_inliers, image_ids, image_cluster, video_frame_info,
+  //   image_id_to_name);
   inter_clusters = ClusteringScenesWithViewGraph(image_cluster);
 
 
@@ -507,6 +512,324 @@ int DistributedMapperController::ts_diff(std::string ts1, std::string ts2){
   second.erase(0, std::min(second.find_first_not_of('0'), second.size()-1));
   return std::stoi(second);
 }
+
+void DistributedMapperController::CreateImageViewGraphWithVideos(
+  std::vector<std::pair<image_t, image_t>>& image_pairs,
+  std::vector<int>& num_inliers,
+  std::vector<image_t>& image_ids,
+  ImageCluster& image_cluster,
+  std::unordered_map<image_t, GraphSfM::VideoInfo>& video_frame_info,
+  std::unordered_map<image_t, std::string>& image_id_to_name,
+  size_t& video_num
+)
+{
+  LOG(INFO) << "Creating view graph with video..." << std::endl;
+  //TODO: serial thresh should be different between different video sequences
+  int serial_thresh = 800;
+
+  // collect all edges with weight
+  std::unordered_map<ViewIdPair, int> edges;
+  for (size_t i = 0; i < image_pairs.size(); ++i) {
+    const ViewIdPair view_pair(image_pairs[i].first, image_pairs[i].second);
+    edges[view_pair] = num_inliers[i];
+  }
+
+  // collect all edges in bidirection
+  std::unordered_map<image_t, std::set<image_t>> graph;
+  for (size_t i = 0; i < image_pairs.size(); ++i) {
+    image_t node1 = image_pairs[i].first;
+    image_t node2 = image_pairs[i].second;
+    graph[node1].insert(node2);
+    graph[node2].insert(node1);
+  }
+
+  // memo of images added
+  std::set<image_t> image_added;
+
+  std::unordered_map<image_t, int> distance_to_video;
+  for (const auto & it : video_frame_info) {
+    image_t image_id = it.first;
+    distance_to_video.emplace(image_id, 0);
+  }
+
+  // 1. Consider edges which both vertices are in same video
+  LOG(INFO) << "Building view graph's arterial...\n";
+  LOG(INFO) << "Number of images in video sequences: "
+            << video_frame_info.size() << std::endl;
+  for (const auto & it1 : video_frame_info) {
+    for (const auto & it2 : video_frame_info) {
+      image_t image1 = it1.first;
+      image_t image2 = it2.first;
+      // Redundancy
+      if (image1 >= image2)
+        continue;
+      
+      // Two image are not in same video sequence
+      if (it1.second.video_id != it2.second.video_id)
+        continue;
+      
+      // No edge between these two image
+      if (graph[image1].find(image2) == graph[image1].end())
+        continue;
+
+      // Check serial num diff
+      if (abs(it1.second.serial_id - it2.second.serial_id) > serial_thresh)
+        continue;
+      
+      // Legal frame pair
+      ViewIdPair view_pair = std::make_pair(image1, image2);
+      image_cluster.edges[view_pair] = edges[view_pair];
+
+      image_cluster.graph[image1].insert(image2);
+      image_cluster.graph[image2].insert(image1);
+
+      // Only add image (frames) in video 0
+      if (it1.second.video_id > 0) {
+        // LOG(INFO) << "Skip init" << it1.second.serial_id << std::endl;
+        continue;
+      }
+      if (image_added.find(image1) == image_added.end()) {
+        image_cluster.image_ids.push_back(image1);
+        image_added.insert(image1);
+      }
+      if (image_added.find(image2) == image_added.end()) {
+        image_cluster.image_ids.push_back(image2);
+        image_added.insert(image2);
+      }
+    }
+  }
+  LOG(INFO) << "Added image num in initialization: "
+            << image_added.size() << std::endl;
+  // Check how many videos
+  LOG(INFO) << "Video count: " << video_num << std::endl;
+
+  // 2. Consider rest of edges
+  int image_remain = image_ids.size() - image_added.size();
+  std::set<int> added_video;
+  added_video.insert(0);
+  // Map individual with it's closest serial id
+  std::unordered_map<image_t, GraphSfM::VideoInfo> closest_frame;
+  for (const auto & it : video_frame_info) {
+    closest_frame.emplace(it.first, it.second);
+  }
+
+  LOG(INFO) << "Add rest images into view graph, image nums: "
+            << image_remain << std::endl;
+  // LOG(INFO) << "STOP HERE\n";
+  // return;
+  // TODO: make these two weight become parameters. 
+  double weight_vio = 1.0;
+  double weight_no_vio = 1.0;
+  // 2.1. Maintain heap for edge strength
+  struct ScoreInfo{
+    double score;
+    image_t reference;
+  };
+  struct HeapData{
+    image_t image_id;
+    image_t reference;
+    double score;
+  };
+  std::unordered_map<image_t, ScoreInfo> max_score;
+  std::vector<HeapData> edge_heap;
+
+  // Heap initialization
+  for (auto & image_id : image_ids) {
+    // Only consider images that are not added
+    if (image_added.find(image_id) != image_added.end())
+      continue;
+    double best_score = 0.0;
+    image_t best_ref;
+    for (auto ref_id : graph[image_id]) {
+      // Only consider reference images that are in video 0
+      if (image_added.find(ref_id) == image_added.end() ||
+          video_frame_info[ref_id].video_id > 0)
+        continue;
+      double score = CalculateScore(
+        image_id, ref_id, edges, image_cluster.graph,
+        video_frame_info, weight_vio, weight_no_vio);
+      if (score > best_score) {
+        best_score = score;
+        best_ref = ref_id;
+      }
+    }
+    ScoreInfo best_info = {best_score, best_ref};
+    max_score.emplace(image_id, best_info);
+    HeapData heap_data = {image_id, best_ref, best_score};
+    edge_heap.push_back(heap_data);
+  }
+
+  const auto cmp_heap = [](const HeapData& info1, const HeapData& info2){
+    return info1.score < info2.score;
+  };
+  std::make_heap(edge_heap.begin(), edge_heap.end(), cmp_heap);
+
+  // 2.2. Always add the image with the largest score
+  while (!edge_heap.empty()) {
+    HeapData heap_top = edge_heap.front();
+    std::pop_heap(edge_heap.begin(), edge_heap.end(), cmp_heap);
+    edge_heap.pop_back();
+    // Deal with redundancy
+    if (image_added.find(heap_top.image_id) != image_added.end())
+      continue;
+    // LOG(INFO) << "Added image: " << heap_top.image_id << "---->"
+    //           << heap_top.reference << ", score: "
+    //           << heap_top.score << std::endl;
+    LOG(INFO) << "Added image: " << image_id_to_name[heap_top.image_id]
+              << "---->" << image_id_to_name[heap_top.reference]
+              << ", score: " << heap_top.score << std::endl;
+    
+    // Add image
+    if (video_frame_info.find(heap_top.image_id) == video_frame_info.end()) {
+      closest_frame.emplace(heap_top.image_id,
+                           closest_frame[heap_top.reference]);
+    }
+    image_cluster.image_ids.push_back(heap_top.image_id);
+    image_added.insert(heap_top.image_id);
+    LOG(INFO) << "Remain image: " << --image_remain << std::endl;
+    
+    // 2.2.2. Recursivly add edges to view graph
+    uint recursive_limit = 2;
+    struct QueueData {
+      image_t image_id;
+      uint recursive_time;
+    };
+    std::set<image_t> que_mem;
+    std::queue<QueueData> que;
+    // Init queue
+    for (const auto & ref_neighbor 
+         : image_cluster.graph[heap_top.reference]) {
+      if (que_mem.find(ref_neighbor) != que_mem.end())
+        continue;
+      QueueData que_data{ref_neighbor, 1};
+      que_mem.insert(ref_neighbor);
+      que.push(que_data);
+    }
+    int min_dist = INT_MAX;
+    while (!que.empty()) {
+      QueueData que_data = que.front();
+      que.pop();
+      image_t image_id = que_data.image_id;
+
+      // Stop if reach recursive limit
+      if (que_data.recursive_time > recursive_limit)
+        break;
+
+      // Check two images are not link to two serial images that are
+      // false match
+      if (closest_frame[heap_top.image_id].video_id ==
+          closest_frame[image_id].video_id &&
+          abs(closest_frame[heap_top.image_id].serial_id -
+              closest_frame[image_id].serial_id) > serial_thresh)
+        continue;
+
+      // Add edge
+      const ViewIdPair view_pair = heap_top.image_id < image_id
+        ? std::make_pair(heap_top.image_id, image_id)
+        : std::make_pair(image_id, heap_top.image_id);
+      
+      // Only add edge if weight is greater than a thresh
+      if (edges[view_pair] <= 0)
+        continue;
+
+      image_cluster.edges[view_pair] = 
+        video_frame_info.find(image_id) == video_frame_info.end()
+        ? edges[view_pair] * weight_no_vio
+        : edges[view_pair] * weight_vio;
+      image_cluster.graph[image_id].insert(heap_top.image_id);
+      image_cluster.graph[heap_top.image_id].insert(image_id);
+      LOG(INFO) << "\t\tAdd edge round " << que_data.recursive_time
+                << ", " << image_id_to_name[heap_top.image_id] << "--->"
+                << image_id_to_name[image_id] << ", score: "
+                << edges[view_pair] << std::endl;
+      min_dist = std::min(min_dist, distance_to_video[image_id]);
+      for (const auto & ref_neighbor : image_cluster.graph[image_id]) {
+        // Redundancy check
+        if (que_mem.find(ref_neighbor) != que_mem.end())
+          continue;
+        que_mem.insert(ref_neighbor);
+        QueueData new_neighbor = {ref_neighbor, que_data.recursive_time+1};
+        que.push(new_neighbor);
+      }
+    }
+    distance_to_video.emplace(heap_top.image_id, min_dist + 1);
+    // 2.2.3. Update
+    std::set<image_t> ref_candidate;
+    if (video_frame_info.find(heap_top.image_id) == video_frame_info.end() ||
+        added_video.find(video_frame_info[heap_top.image_id].video_id) != added_video.end()) {
+      ref_candidate = image_cluster.graph[heap_top.image_id];
+    } else {
+      LOG(INFO) << "Adding new video seq into graph...";
+      int added_video = video_frame_info[heap_top.image_id].video_id;
+      for (const auto & it : video_frame_info) {
+        if (it.second.video_id != added_video)
+          continue;
+        image_t image_id = it.first;
+        image_added.insert(image_id);
+        image_cluster.image_ids.push_back(image_id);
+        ref_candidate.insert(image_id);
+        --image_remain;
+      }
+    }
+    ref_candidate.insert(heap_top.image_id);
+    for (auto & image_id : image_ids) {
+      // Only consider images that are not added
+      if (image_added.find(image_id) != image_added.end())
+        continue;
+      // Check if need to update max score
+      bool updated = false;
+      
+      for (auto ref_id : ref_candidate) {
+        double score = CalculateScore(
+            image_id, ref_id, edges, image_cluster.graph,
+            video_frame_info, weight_vio, weight_no_vio);
+        if (score > max_score[image_id].score) {
+          updated = true;
+          max_score[image_id].score = score;
+          max_score[image_id].reference = ref_id;
+        }
+      }
+      if (updated) {
+        HeapData heap_data = {image_id,
+                              max_score[image_id].reference,
+                              max_score[image_id].score};
+        edge_heap.push_back(heap_data);
+        std::push_heap(edge_heap.begin(), edge_heap.end(), cmp_heap);
+      }
+    }
+  }
+
+  // 3. Delete false positive feature matches in database
+  LOG(INFO) << "Delete false feature matches in database..." << std::endl;
+  Database database(options_.database_path);
+  for (uint i = 0; i < image_pairs.size(); ++i) {
+    image_t image_id1 = image_pairs[i].first;
+    image_t image_id2 = image_pairs[i].second;
+    const ViewIdPair view_pair(image_id1, image_id2);
+    if (image_cluster.edges.find(view_pair) == image_cluster.edges.end()) {
+      // Only delete view pair that inliers < 20
+      if (edges[view_pair] >= 20&&
+          distance_to_video[image_id1] > 1 &&
+          distance_to_video[image_id2] > 1)
+      // if (image_id_to_name[image_id1].find("2f") != std::string::npos &&
+      //     image_id_to_name[image_id2].find("2f") != std::string::npos ||
+      //     image_id_to_name[image_id1].find("4f") != std::string::npos &&
+      //     image_id_to_name[image_id2].find("4f") != std::string::npos)
+        continue;
+      database.DeleteInlierMatches(image_id1, image_id2);
+      // LOG(INFO) << "Delete inlier match: " << image_id1 << " " << image_id2 << std::endl;
+      LOG(INFO) << "Delete match: " << image_id_to_name[image_id1] << " "
+                << image_id_to_name[image_id2] << ", " << edges[view_pair]
+                << std::endl;
+    }
+  }
+
+  // Check graph completness
+  // LOG(INFO) << "Number of images in graph: " << image_cluster.image_ids.size() << std::endl;
+  // LOG(INFO) << "Number of images (total): " << image_ids.size() << std::endl;
+}
+
+
 
 
 void DistributedMapperController::CreateImageViewGraphWithVideo(

@@ -170,6 +170,15 @@ private:
         ImageCluster& image_cluster,
         std::vector<GraphSfM::VIOThresh>& vio_thresh);
 
+    void CreateImageViewGraphWithVideos(
+        std::vector<std::pair<image_t, image_t>>& image_pairs,
+        std::vector<int>& num_inliers,
+        std::vector<image_t>& image_ids,
+        ImageCluster& image_cluster,
+        std::unordered_map<image_t, GraphSfM::VideoInfo>& video_frame_info,
+        std::unordered_map<image_t, std::string>& image_id_to_name,
+        size_t& vide_num);
+
     void CreateImageViewGraphWithVideo(
         std::vector<std::pair<image_t, image_t>>& image_pairs,
         std::vector<int>& num_inliers,
